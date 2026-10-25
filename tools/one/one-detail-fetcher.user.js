@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ONE 详情页 · 模块 token 取数器
 // @namespace    qoder.one.detail.fetcher
-// @version      2.17.0
-// @description  不依赖 URL：拦截页面自己发出的 /v2.5/article/detail（真实传输是 XHR），解密请求体还原文章 id 与 dn，再用 one 模块 token 重取一次详情；按「正片/预告 × MP4/M3U8」四格铺链接（可点、可选中复制），缺哪格就写清为什么缺，并对比两种身份。设置里可开「自动替换页面的 token」（默认关，开关会被记住）：开着时 App 自己发出的请求出门前就换成所选 token，页面直接看到替换身份的结果。拿到链接后点「⬇」先填一张单子（选哪条链接、文件名、请求头——UA 与来源已铺进那一栏、改栏里的字就按改后的发，M3U8 还问要不要转成 MP4，勾一下就把产物自动传到 Hugging Face 数据集、上传目录可改且会被记住），确认后投给本仓库的 Actions：MP4 → aria2.yml，M3U8 → m3u8.yml
+// @version      2.18.0
+// @description  不依赖 URL：拦截页面自己发出的 /v2.5/article/detail（真实传输是 XHR），解密请求体还原文章 id 与 dn，再用 one 模块 token 重取一次详情；按「正片/预告 × MP4/M3U8」四格铺链接（可点、可选中复制），缺哪格就写清为什么缺，并对比两种身份。设置里可开「自动替换页面的 token」（默认关，开关会被记住）：开着时 App 自己发出的请求出门前就换成所选 token，页面直接看到替换身份的结果。拿到链接后点「⬇」先填一张单子（选哪条链接、发到哪、文件名、请求头——UA 与来源已铺进那一栏、改栏里的字就按改后的发，M3U8 还问要不要转成 MP4，勾一下就把产物自动传到 Hugging Face 数据集、上传目录可改且会被记住），确认后可以同时投给：本仓库的 Actions（MP4 → aria2.yml，M3U8 → m3u8.yml）、本地/局域网 aria2（JSON-RPC）、MediaGo（HTTP API）—— 后两个由伴生脚本 one-local-dispatch.user.js 代发
 // @match        https://j7tu.com/*
 // @match        http://j7tu.com/*
 // @grant        none
@@ -81,6 +81,22 @@
  *   ⚙ 里那栏只存「额外要带的」，因为 ⚙ 要落 localStorage，把此刻的 UA 存进去迟早过期；
  *   单子是每次现开的，铺进去的两条永远跟着当前页面。
  *   M3U8 那条链接里的 params 是按次生成的，runner 排队+启动要几十秒到几分钟，过期就重取详情再触发。
+ *
+ * 三个出口（v2.18 加本地 aria2 / MediaGo）：
+ *   单子上「发送到哪」是一排勾，可以只勾一个，也可以一次全勾：
+ *     · GitHub Actions  → 上面那两个 yml（跑在你自己的仓库上，产物在 artifacts / HF）
+ *     · 本地 aria2      → aria2 JSON-RPC（addUri + tellStatus 轮询进度）
+ *     · MediaGo         → MediaGo HTTP API（POST /api/downloads + GET 轮询）
+ *   后两个打在 127.0.0.1 / 局域网地址上，而本脚本是 @grant none（跑在页面主世界，
+ *   拦 App 请求靠的就是它）—— 页面里的 fetch 打本地端口会被 CORS 与私有网络策略挡住，
+ *   读不到结果。能打通的只有 GM_xmlhttpRequest，而它必须 @grant，一加 @grant 脚本就
+ *   进沙箱、拦不到 App。所以拆成两个脚本：本脚本一行 @grant 都不加，本地那两个出口
+ *   交给伴生脚本 tools/one/one-local-dispatch.user.js（带 GM_xmlhttpRequest，无界面、
+ *   无存储）代发，两边用 <html> 上的属性传话（和「自动替换」用的 data-oneqz-repl
+ *   同一套跨世界桥法，只用字符串，不跨 realm 传对象）。
+ *   没装伴生脚本时这两个勾不会骗人：面板直接说「没检测到转发脚本」，只发 GitHub。
+ *   ⚙ 里 aria2/MediaGo 那几栏是本机默认值（RPC 地址、密钥、MediaGo 地址、API Key、
+ *   下载目录），单子上可以改，改过就记住 —— 和 HF 那几栏同一个待遇。
  */
 (function () {
   "use strict";
@@ -101,7 +117,7 @@
      App 只在「从列表点卡片」那一刻发 /v2.5/article/detail；刷新/直开时它一个都不发。
      多盯几个，只要任意一个经过钩子就能还原出 id，拿到 id 后我们自己再发 detail 就行。 */
   var WATCH = [DETAIL, "/v2.5/comment/list", "/v2.5/article/like", "/v2.5/article/download", "/v2.5/panda/url"];
-  var SCRIPT_VERSION = "2.17.0";   // 面板里会打出来，免得再拿旧版截图对新代码
+  var SCRIPT_VERSION = "2.18.0";   // 面板里会打出来，免得再拿旧版截图对新代码
 
   /* one 模块身份：/box/api/splash 下发的共享凭证，iss=4406487，昵称 176*****801。
      它随模块启动由宿主注入，浏览器侧取不到（splash 走 http://ip:6868 且校验 time+uuid 绑定对），
@@ -633,6 +649,7 @@
 
   function installHooks() {
     window.addEventListener("message", onMessage, false);
+    lclArm();                        // 本地转发的回应通道：越早挂越好，发送时才不会漏掉最早那条回应
     WORLD = detectWorld();
     /* 主世界（@grant none 的正常情形）：直接 patch 页面的 fetch/XHR 就能拦到 App，
        不需要注入、不需要回传，也不受 CSP 影响。隔离世界才需要注入+postMessage 那条路。 */
@@ -1209,7 +1226,10 @@
           plan.map(function (p) { return p.who + " " + p.fmt; }).join(" / ") + " —— 换格式，或换身份重取详情。", "bad");
       return Promise.resolve(null);
     }
-    if (!cfg.token) { log("还没填 GitHub Token（⚙ 最下面那一栏），填好会自动保存。", "bad"); return Promise.resolve(null); }
+    if (!cfg.token) {
+      log("还没填 GitHub Token（⚙ 里那一栏），填好会自动保存 —— 或者这张单子只发本地 aria2 / MediaGo。", "bad");
+      return Promise.resolve(null);
+    }
     var wf = GH_WF[item.fmt];
     log("── 发到 GitHub 下载 ──", "dim");
     log("   用的详情   " + ((res.from || "?") + "，标题 " + (src.title || "（无）")), "dim");
@@ -1251,6 +1271,300 @@
       log("✓ 已触发（HTTP 204，GitHub 这个接口不返回运行 id，下面按时间认）", "ok");
       return watchRun(my, cfg, wf, triggeredAt);
     }).catch(function (e) { log("× 触发失败：" + String(e && e.message || e), "bad"); });
+  }
+
+  /* ---------- 本地出口：aria2 / MediaGo（v2.18） ----------
+     这两个出口打在 127.0.0.1 或局域网地址上，而本脚本是 @grant none（跑在页面主世界）：
+     页面里的 fetch 打本地端口会被 CORS 与私有网络策略挡住，读不到结果。能打通的只有
+     GM_xmlhttpRequest，而它必须 @grant，一加 @grant 脚本就进沙箱、拦不到 App ——
+     所以本地请求交给伴生脚本 tools/one/one-local-dispatch.user.js 代发。
+
+     两边共用 DOM，就用 <html> 上的属性传话（和「自动替换」用的 data-oneqz-repl 同一套
+     做法，只用字符串，不跨 realm 传对象）：
+       主 → 伴生  data-oneqz-local      = { q: [ { id, op, payload } ] }
+       伴生 → 主  data-oneqz-local-res  = { q: [ { id, ok, data|error } ] }
+       伴生就绪   data-oneqz-local-ready= { v, at }
+     为什么是队列而不是「一次一个值」：MutationObserver 在回调里只能看到属性的**最终值**，
+     两次写落进同一个批次，前一次就被后一次盖掉（表现是没回应、25 秒后超时）。所以两个
+     方向都写自己的队列属性、谁也不改对方的属性：主脚本只追加 data-oneqz-local、
+     伴生只追加 data-oneqz-local-res，两边按 id 认领。回应留着不摘也无所谓（最多 20 条，
+     认领过的 id 不会再被认领一次），这样彻底避开丢消息。 */
+  var LCL_REQ = "data-oneqz-local";
+  var LCL_RES = "data-oneqz-local-res";
+  var LCL_READY = "data-oneqz-local-ready";
+  var LCL_WAIT_MS = 25000;
+  var LCL_KEEP = 20;                   // 请求队列里最多留几条（都是已认领的，留着只为不覆盖）
+  var lclSeq = 0, lclWait = {}, lclMo = null, lclQueue = [];
+  var ariaJob = 0, mgJob = 0;          // 两个本地出口各自的轮询代次号（互不干扰）
+  var ARIA_POLL_MS = 600000, ARIA_POLL_GAP = 3000;
+  var MG_POLL_MS = 600000, MG_POLL_GAP = 3000;
+
+  function lclVersion() {
+    try {
+      var raw = document.documentElement.getAttribute(LCL_READY);
+      var j = raw ? safeJson(raw) : null;
+      return (j && j.v) || "";
+    } catch (e) { return ""; }
+  }
+  function lclSettle(raw) {
+    var j = raw ? safeJson(raw) : null;
+    var q = (j && j.q) || [];
+    for (var i = 0; i < q.length; i++) {
+      var r = q[i];
+      if (!r || !r.id || !lclWait[r.id]) continue;
+      var w = lclWait[r.id];
+      delete lclWait[r.id];
+      if (w.timer) clearTimeout(w.timer);
+      if (r.ok) w.resolve(r.data === undefined ? null : r.data);
+      else w.reject(new Error(r.error || "本地转发失败"));
+    }
+  }
+  function lclArm() {
+    if (lclMo || !document.documentElement) return;
+    if (typeof MutationObserver !== "function") return;
+    var mo = new MutationObserver(function (recs) {
+      for (var i = 0; i < recs.length; i++) {
+        if (recs[i].attributeName === LCL_RES) lclSettle(document.documentElement.getAttribute(LCL_RES));
+      }
+    });
+    try { mo.observe(document.documentElement, { attributes: true, attributeFilter: [LCL_RES] }); lclMo = mo; }
+    catch (e) {}
+  }
+  function lclMissing() {
+    return new Error("没有检测到本地转发脚本（伴生脚本 one-local-dispatch.user.js 没装，或装完还没刷新本页）。" +
+      "本地 aria2 / MediaGo 靠它代发：页面主世界的 fetch 打不通 127.0.0.1（CORS / 私有网络策略）。" +
+      "装好后刷新一次页面，面板顶部会显示「本地转发 v…」");
+  }
+  function lclCall(op, payload, timeoutMs) {
+    if (!lclVersion()) return Promise.reject(lclMissing());
+    lclArm();
+    var id = "one" + Date.now().toString(36) + "-" + (++lclSeq);
+    var ms = timeoutMs || LCL_WAIT_MS;
+    return new Promise(function (resolve, reject) {
+      var w = { resolve: resolve, reject: reject, timer: 0 };
+      lclWait[id] = w;
+      w.timer = setTimeout(function () {
+        if (!lclWait[id]) return;
+        delete lclWait[id];
+        reject(new Error("本地转发脚本 " + Math.round(ms / 1000) + " 秒没回应（它可能被禁用了，或那个端口一直没回）"));
+      }, ms);
+      /* 追加进队列再整体写：写自己这条属性，不碰伴生脚本那条，所以不会互相覆盖 */
+      lclQueue.push({ id: id, op: op, payload: payload || {} });
+      if (lclQueue.length > LCL_KEEP) lclQueue.splice(0, lclQueue.length - LCL_KEEP);
+      try {
+        document.documentElement.setAttribute(LCL_REQ, JSON.stringify({ q: lclQueue }));
+      } catch (e) {
+        delete lclWait[id]; clearTimeout(w.timer); reject(e);
+      }
+    });
+  }
+
+  /* aria2 / MediaGo 的本机默认值。都是「这台机器上怎么连」与「上次存在哪」，
+     属于会记住的偏好（⚙ 里能改），单子上也能改 —— 改的是同一个键。 */
+  function ariaCfg() {
+    var rpc = String(store.get("one_aria_rpc", "http://127.0.0.1:6800/jsonrpc") || "").trim();
+    return {
+      /* 尾斜杠去掉：日志里看着干净，也免得拼出 //jsonrpc 被某些反代当成别的路径 */
+      rpc: (rpc || "http://127.0.0.1:6800/jsonrpc").replace(/\/+$/, ""),
+      secret: String(store.get("one_aria_secret", "") || ""),
+      dir: String(store.get("one_aria_dir", "") || "").trim(),
+      proxy: String(store.get("one_aria_proxy", "") || "").trim(),
+      multi: store.get("one_aria_multi", "1") !== "0"
+    };
+  }
+  function mgCfg() {
+    var base = String(store.get("one_mg_base", "http://127.0.0.1:9900") || "").trim();
+    return {
+      base: (base || "http://127.0.0.1:9900").replace(/\/+$/, ""),
+      key: String(store.get("one_mg_key", "") || ""),
+      folder: String(store.get("one_mg_folder", "") || "").trim(),
+      del: store.get("one_mg_del", "1") !== "0"
+    };
+  }
+
+  /* 单子上那一栏请求头 → 本地服务要的形状。和 GitHub 那条用同一份解析：
+     栏里写什么发什么（栏里本来就已经铺好了 UA 与来源），不是后台另补一套。 */
+  function selHeaderJson(sel) {
+    if (sel && sel.headers !== undefined) return ghFormHeadersJson(sel.headers);
+    return ghHeadersJson(ghCfg().headers);
+  }
+  function headerListOf(json) {
+    var o = json ? safeJson(json) : null;
+    if (!o || typeof o !== "object") return [];
+    return Object.keys(o).map(function (k) { return k + ": " + o[k]; });
+  }
+
+  function ariaStatusText(s) {
+    var zh = { waiting: "等待中", active: "下载中", paused: "已暂停", complete: "完成",
+               error: "失败", removed: "已移除" };
+    return zh[s] || s || "?";
+  }
+  function mgStatusText(s) {
+    var zh = { waiting: "等待中", downloading: "下载中", success: "完成", failed: "失败", stopped: "已停止" };
+    return zh[s] || s || "?";
+  }
+  /* aria2 的 out 是「-o 原样落盘」：MP4 给带后缀的名字；M3U8 给它 .m3u8，
+     否则会得到一个没有扩展名的文件（而 aria2 本身不下 HLS，见下面的提醒）。 */
+  function ariaOutName(name, fmt) {
+    var p = ghSplitExt(name);
+    if (!p.stem) return "";
+    return p.stem + "." + (p.ext || (fmt === "M3U8" ? "m3u8" : "mp4"));
+  }
+
+  /* 下发到 aria2：addUri 回来就返回，进度轮询丢到后台。
+     两个本地出口可以同时勾，所以各自的轮询用各自的代次号（ariaJob / mgJob）：
+     再发一次 aria2 只作废旧的那条 aria2 轮询，不碰 MediaGo 的。 */
+  function sendToAria2(item, sel) {
+    var cfg = ariaCfg();
+    var plan = { rpc: cfg.rpc, secret: cfg.secret };
+    var opts = { "allow-overwrite": sel.overwrite ? "true" : "false", "auto-file-renaming": "false" };
+    if (cfg.dir) opts.dir = cfg.dir;
+    if (cfg.proxy) opts["all-proxy"] = cfg.proxy;
+    var hl = headerListOf(selHeaderJson(sel));
+    if (hl.length) opts.header = hl;
+    if (cfg.multi) {
+      opts.split = "16";
+      opts["max-connection-per-server"] = "16";
+      opts["min-split-size"] = "1M";
+    }
+    var out = ariaOutName(sel.name, item.fmt);
+    if (out) opts.out = out;
+
+    log("── 发给本地 aria2 ──", "dim");
+    log("   RPC        " + cfg.rpc + (cfg.secret ? "（带 RPC 密钥）" : "（无密钥）"), "dim");
+    log("   urls       " + item.url);
+    log("   out        " + (out || "（空：aria2 按 URL 命名）") + (cfg.dir ? "    dir " + cfg.dir : ""), "dim");
+    log("   header     " + (hl.length ? hl.join(" | ") : "（不带）"), "dim");
+    if (cfg.multi) log("   多连接     开（-x 16 -s 16）", "dim");
+    if (item.fmt === "M3U8")
+      log("   提醒：aria2 原版不解析 HLS，这条 .m3u8 大概率只会下到播放列表文件本身（要分片得用 aria2-next 之类支持 HLS 的版本，" +
+          "或者改发 GitHub 的 m3u8.yml / MediaGo）", "bad");
+    var my = ++ariaJob;
+    return lclCall("aria2.call", { rpc: plan.rpc, secret: plan.secret, method: "aria2.addUri",
+                                  params: [[item.url], opts] }).then(function (gid) {
+      log("✓ 已加入 aria2   gid=" + gid + "（进度在后台轮询，不挡别的出口）", "ok");
+      if (my === ariaJob) ariaPoll(gid, plan, my);      // 不等它：下载可能好几分钟
+      return gid;
+    }).catch(function (e) {
+      log("× 发给 aria2 失败：" + String(e && e.message || e), "bad");
+      return null;
+    });
+  }
+
+  function ariaPoll(gid, cfg, my) {
+    var lastKey = "";
+    function step(left) {
+      if (my !== ariaJob) { log("（又发了一次 aria2，这次轮询停掉）", "dim"); return Promise.resolve(null); }
+      return lclCall("aria2.call", { rpc: cfg.rpc, secret: cfg.secret, method: "aria2.tellStatus",
+        params: [gid, ["gid", "status", "totalLength", "completedLength", "downloadSpeed", "errorMessage", "files"]] })
+        .then(function (st) {
+          st = st || {};
+          var total = Number(st.totalLength) || 0, done = Number(st.completedLength) || 0;
+          var pct = total > 0 ? Math.floor(done / total * 100) : 0;
+          /* 每 3 秒一条会把面板刷满：只有状态、百分比（按 5% 一档）或「在不在跑」变了才写一行 */
+          var key = (st.status || "?") + "|" + Math.floor(pct / 5) + "|" + (Number(st.downloadSpeed) > 0 ? 1 : 0);
+          if (key !== lastKey) {
+            lastKey = key;
+            log("   " + ariaStatusText(st.status) +
+                (total > 0 ? "  " + pct + "%（" + mb(done) + " / " + mb(total) + "）" : "") +
+                (Number(st.downloadSpeed) > 0 ? "  " + mb(st.downloadSpeed) + "/s" : "") +
+                (st.files && st.files[0] && st.files[0].path ? "  → " + st.files[0].path : ""),
+                st.status === "error" ? "bad" : (st.status === "complete" ? "ok" : "dim"));
+          }
+          if (st.status === "complete") { log("✓ aria2 下载完成（文件在 aria2 那台机器上，路径见上一行）", "ok"); return st; }
+          if (st.status === "error" || st.status === "removed") {
+            log("× aria2 结束：" + (st.errorMessage || st.status), "bad");
+            return st;
+          }
+          if (left <= 0) { log("本机轮询到 " + Math.round(ARIA_POLL_MS / 1000) + " 秒结束，aria2 里应该还在跑", "dim"); return st; }
+          return sleep(ARIA_POLL_GAP).then(function () { return step(left - ARIA_POLL_GAP); });
+        }, function (e) {
+          log("× 查 aria2 进度失败：" + String(e && e.message || e), "bad");
+          return null;
+        });
+    }
+    return step(ARIA_POLL_MS);
+  }
+
+  /* 下发到 MediaGo：POST /api/downloads 一次一个任务；返回任务 id 就返回，进度丢到后台。
+     MediaGo 的 /api/downloads 没有选流参数，但我们这条链接本身就是详情给出的具体清单
+     （不是多码率的 master），所以不需要在页面侧选画质 —— 这一点和 m3u8 站点抓到的
+     master 播放列表不同，那里必须先选流再发。 */
+  function sendToMediaGo(item, sel) {
+    var cfg = mgCfg();
+    var hdr = headerListOf(selHeaderJson(sel)).join("\n");   // MediaGo 要「每行一个 Name: Value」
+    var type = /\.m3u8(?:$|[?#])/i.test(item.url) ? "m3u8" : "direct";
+    var task = { type: type, url: item.url };
+    var stem = ghSplitExt(sel.name).stem;
+    if (stem) task.name = sanitizeFileName(stem);             // 后缀交给 MediaGo 按类型补
+    if (cfg.folder) task.folder = cfg.folder;
+    if (hdr) task.headers = hdr;
+    if (cfg.del) task.deleteSegments = true;
+
+    log("── 发给 MediaGo ──", "dim");
+    log("   地址       " + cfg.base + (cfg.key ? "（带 API Key）" : "（无认证）"), "dim");
+    log("   task       type=" + type + "   name=" + (task.name || "（空：MediaGo 按 URL 命名）") +
+        (cfg.folder ? "   folder=" + cfg.folder : ""), "dim");
+    log("   urls       " + item.url);
+    log("   headers    " + (hdr ? hdr.replace(/\n/g, " | ") : "（不带）"), "dim");
+    var my = ++mgJob;
+    return lclCall("mediago.call", { base: cfg.base, key: cfg.key, method: "POST",
+                                    path: "/api/downloads", body: { tasks: [task], startDownload: true } })
+      .then(function (created) {
+        var list = Array.isArray(created) ? created : ((created && created.list) || []);
+        if (!list.length) {
+          log("× MediaGo 没返回创建出来的任务（可能已存在相同任务），去它自己的界面看", "bad");
+          return null;
+        }
+        var id = list[0] && list[0].id;
+        log("✓ 已创建 MediaGo 任务" + (id ? "  #" + id : "") + "（进度在后台轮询，不挡别的出口）", "ok");
+        if (my === mgJob && id !== undefined && id !== null) mgPoll(id, cfg, my);
+        return id;
+      }).catch(function (e) {
+        log("× 发给 MediaGo 失败：" + String(e && e.message || e), "bad");
+        return null;
+      });
+  }
+
+  function mgPoll(id, cfg, my) {
+    var lastKey = "";
+    function step(left) {
+      if (my !== mgJob) { log("（又发了一次 MediaGo，这次轮询停掉）", "dim"); return Promise.resolve(null); }
+      return lclCall("mediago.call", { base: cfg.base, key: cfg.key, method: "GET",
+        path: "/api/downloads/" + encodeURIComponent(String(id)) })
+        .then(function (st) {
+          st = st || {};
+          var key = String(st.status || "?");
+          if (key !== lastKey) {
+            lastKey = key;
+            log("   " + mgStatusText(st.status) + (st.file ? "  → " + st.file : ""),
+                st.status === "failed" ? "bad" : (st.status === "success" ? "ok" : "dim"));
+          }
+          if (st.status === "success") { log("✓ MediaGo 下载完成", "ok"); return st; }
+          if (st.status === "failed" || st.status === "stopped") {
+            log("× MediaGo 结束：" + (st.status === "failed" ? "失败" : "已停止"), "bad");
+            return st;
+          }
+          if (left <= 0) { log("本机轮询到 " + Math.round(MG_POLL_MS / 1000) + " 秒结束，MediaGo 里应该还在跑", "dim"); return st; }
+          return sleep(MG_POLL_GAP).then(function () { return step(left - MG_POLL_GAP); });
+        }, function (e) {
+          log("× 查 MediaGo 进度失败：" + String(e && e.message || e), "bad");
+          return null;
+        });
+    }
+    return step(MG_POLL_MS);
+  }
+
+  /* 单子上勾了哪几个出口就往哪几个发。顺序是先本地后 GitHub：本地那两条拿到任务 id 就
+     回来（进度在后台轮询），不会因为 GitHub 那边要排队几分钟而让本地迟迟不下发。 */
+  function sendToTargets(res, sel) {
+    var t = (sel && sel.targets) || { gh: true };
+    var jobs = [];
+    if (t.aria) jobs.push(function () { return sendToAria2(sel.item, sel); });
+    if (t.mg) jobs.push(function () { return sendToMediaGo(sel.item, sel); });
+    if (t.gh) jobs.push(function () { return sendToAction(res, sel); });
+    if (!jobs.length) { log("一个出口都没勾：勾上 GitHub / aria2 / MediaGo 里至少一个再确认。", "bad"); return Promise.resolve(null); }
+    return jobs.reduce(function (p, fn) { return p.then(fn); }, Promise.resolve(null));
   }
 
   /* ---------- UI ---------- */
@@ -1345,6 +1659,7 @@
     "#oneqz .cfg.on{display:block}",
     "#oneqz .cfg label{display:block;margin:4px 0;color:#9aa3b8}",
     "#oneqz .cfg input,#oneqz .cfg select{width:100%;box-sizing:border-box;background:#0d0f14;color:#e8e8ee;border:1px solid #3a4050;border-radius:4px;padding:4px;font:inherit}",
+    "#oneqz .cfg input[type=checkbox]{width:auto;margin:0 6px 0 0;vertical-align:-2px}",
     /* 复选框不能跟着 input 的 width:100% 走，否则整行被撑成一个巨大的方块 */
     "#oneqz .cfg label.auto{background:#0f1320;border:1px solid #3a4050;border-radius:6px;padding:6px}",
     "#oneqz .cfg label.auto input[type=checkbox]{width:auto;margin:0 6px 0 0;vertical-align:-2px}",
@@ -1354,6 +1669,10 @@
     "#oneqz .ghform input[type=text]{width:100%;box-sizing:border-box;background:#0d0f14;color:#e8e8ee;" +
       "border:1px solid #3a4050;border-radius:4px;padding:4px;font:inherit}",
     "#oneqz .ghform input[type=radio],#oneqz .ghform input[type=checkbox]{width:auto;margin:0 6px 0 0;vertical-align:-2px}",
+    /* 单子里的子分组：aria2 / MediaGo 各自一块，只勾了哪个才显出来 */
+    "#oneqz .ghform .ghsub{margin:8px 0 0;padding:6px 8px;border:1px dashed #3a4050;border-radius:6px;background:#0c0f16}",
+    "#oneqz .ghform .ghsub>div.dim{margin-bottom:2px}",
+    "#oneqz .ghform .ghsub label{display:block;margin:4px 0;color:#9aa3b8}",
     "#oneqz .ghform .ghrow{display:flex;gap:6px;margin-top:8px}",
     "#oneqz .ok{color:#7ddc8f}#oneqz .bad{color:#ff8f8f}#oneqz .dim{color:#8a93a8}",
     "#oneqz .json{color:#c3ffd8;max-height:40vh;overflow:auto;border-top:1px dashed #333a48;margin-top:6px;padding-top:6px}"
@@ -1490,6 +1809,12 @@
           "   fetch 被改写=" + (window.fetch.toString().indexOf("isDetailUrl") >= 0 || window.fetch.toString().indexOf("OF.apply") >= 0 ? "是" : "否"));
     } catch (e) { log("指纹读取失败 " + String(e && e.message || e), "dim"); }
     log("当前路由   " + (location.hash || "(空)") + "   详情页=" + (isDetailPage() ? "是" : "否"));
+    /* 本地出口的那半条链路：没有它，aria2 / MediaGo 两个勾就是灰的 */
+    var lv = lclVersion();
+    log("本地转发   " + (lv
+        ? "伴生脚本在线 v" + lv + " → 本地 aria2 / MediaGo 可用（请求由它用 GM_xmlhttpRequest 发出）"
+        : "没检测到伴生脚本 one-local-dispatch.user.js —— 本地 aria2 / MediaGo 发不出去（本脚本 @grant none，页面 fetch 打不通 127.0.0.1）"),
+        lv ? "ok" : "dim");
     log("钩子计数   经过 " + STAT.seen + " 次 · 请求体解密成功 " + STAT.plain + " 次 · 还原出 id " + STAT.ids + " 次",
         STAT.seen ? "ok" : "bad");
     STAT.last.slice(-6).reverse().forEach(function (x) {
@@ -1644,30 +1969,51 @@
       var r = document.createElement("input");
       r.type = "radio"; r.name = "ghf_item"; r.value = String(i); r.checked = (i === pre);
       lab.appendChild(r);
-      lab.appendChild(document.createTextNode(" " + it.who + " " + it.fmt + " → " + GH_WF[it.fmt] +
-        "（" + ghHostOf(it.url) + "）"));
+      /* 这里只写「哪条链接」，不写会投给哪个 workflow：同一张单子可能只发 aria2 / MediaGo，
+         写死「→ aria2.yml」就是在骗人。去向由下面「发送到哪」那一排勾决定。 */
+      lab.appendChild(document.createTextNode(" " + it.who + " " + it.fmt + "（" + ghHostOf(it.url) + "）"));
       links.appendChild(lab);
     });
     return links;
   }
+
+  /* 「发送到哪」那个勾集合：存在一个键里（"gh,aria,mg"），勾过就记住。
+     装不了/用不了的出口自动剔除，免得存着一个点不亮的勾。 */
+  var DL_TARGETS = ["gh", "aria", "mg"];
+  function dlTargetsOf(hasGh, hasLcl) {
+    var raw = String(store.get("one_dl_targets", "") || "");
+    var set = {};
+    raw.split(",").forEach(function (k) { if (k) set[k] = 1; });
+    if (!raw) { if (hasGh) set.gh = 1; else if (hasLcl) set.aria = 1; }
+    if (!hasGh) delete set.gh;
+    if (!hasLcl) { delete set.aria; delete set.mg; }
+    /* 上次勾的那个这次用不了（比如刚把 Token 清掉），就退到还能用的那个，而不是一个都没勾 */
+    if (!Object.keys(set).length) { if (hasGh) set.gh = 1; else if (hasLcl) set.aria = 1; }
+    return set;
+  }
+
   function openGhForm(res) {
-    var cfg = ghCfg(), hf0 = ghHfCfg();
+    var cfg = ghCfg(), hf0 = ghHfCfg(), aria0 = ariaCfg(), mg0 = mgCfg();
     var plan = res && res.data ? downloadPlan(res.data) : [];
-    /* 没详情 / 没链接 / 没 token 这三种前置不满足的情况，交回 sendToAction 用同一套话回，
-       免得同一个提示两处各写一份、改了一处漏另一处 */
-    if (!res || !res.data || !plan.length || !cfg.token) return sendToAction(res);
+    /* 没详情 / 没链接这两种前置不满足的情况，交回 sendToAction 用同一套话回 ——
+       它在检查 token 之前就会返回，所以不会冒出「没填 Token」这种不相关的提示。 */
+    if (!res || !res.data || !plan.length) return sendToAction(res);
     var title = res.data.title || "";
     var startIdx = (function () { var p = ghPick(plan, cfg.fmt); return p ? plan.indexOf(p) : 0; })();
     var nameDirty = false;
     var nameAutoExt = false;      // 框里那截后缀是表单自己补的、还是用户打的 —— 面板上要说清是谁补的
+    var lclVer = lclVersion();
+    var hasLcl = !!lclVer;
+    var hasGh = !!cfg.token;
+    var pre = dlTargetsOf(hasGh, hasLcl);
     closeGhForm();
 
     var box = document.createElement("div");
     box.className = "ghform";
     var head = document.createElement("div");
     head.className = "dim";
-    head.textContent = "⬇ —— 先确认这一单（只对本次有效；仓库 " + cfg.repo +
-      " / 分支 " + cfg.ref + " 在 ⚙ 里改）";
+    head.textContent = "⬇ —— 先确认这一单（只对本次有效；仓库 " + cfg.repo + " / 分支 " + cfg.ref +
+      " 在 ⚙ 里改" + (hasLcl ? "；本地转发 " + lclVer : "；⚠ 没检测到本地转发脚本，只能发 GitHub") + "）";
     box.appendChild(head);
 
     var links = ghRadioBox(plan, startIdx);
@@ -1679,6 +2025,33 @@
       return plan[0];
     }
 
+    /* ---------- 发送到哪 ---------- */
+    var tgtWrap = document.createElement("div");
+    tgtWrap.className = "dim";
+    tgtWrap.style.marginTop = "8px";
+    tgtWrap.textContent = "发送到哪（可以只勾一个，也可以一次全勾 —— 勾几个就发几次，互不影响）";
+    box.appendChild(tgtWrap);
+
+    function tgtBox(key, text, enabled, why) {
+      var lab = document.createElement("label");
+      var c = document.createElement("input");
+      c.type = "checkbox"; c.name = "ghf_t_" + key;
+      c.checked = !!pre[key] && enabled;
+      c.disabled = !enabled;
+      lab.appendChild(c);
+      lab.appendChild(document.createTextNode(" " + text + (enabled ? "" : " —— " + why)));
+      if (!enabled) lab.className = "dim";
+      box.appendChild(lab);
+      return c;
+    }
+    var tGh = tgtBox("gh", "GitHub Actions（MP4→aria2.yml，M3U8→m3u8.yml）", hasGh,
+                     "⚙ 里还没填 GitHub Token");
+    var tAria = tgtBox("aria", "本地 aria2（JSON-RPC）", hasLcl,
+                       "没装伴生脚本 one-local-dispatch.user.js（页面主世界打不通 127.0.0.1）");
+    var tMg = tgtBox("mg", "MediaGo（HTTP API）", hasLcl,
+                     "没装伴生脚本 one-local-dispatch.user.js");
+
+    /* ---------- 文件名 ---------- */
     var nameLabel = document.createElement("label");
     nameLabel.appendChild(document.createTextNode("文件名 save_name"));
     var nameIn = document.createElement("input");
@@ -1686,6 +2059,7 @@
     nameLabel.appendChild(nameIn);
     box.appendChild(nameLabel);
 
+    /* ---------- GitHub 专用 ---------- */
     var muxLab = document.createElement("label");
     var muxIn = document.createElement("input");
     muxIn.type = "checkbox"; muxIn.name = "ghf_mux";
@@ -1711,13 +2085,78 @@
     pathLab.appendChild(pathIn);
     box.appendChild(pathLab);
 
+    /* ---------- aria2 专用 ---------- */
+    var ariaWrap = document.createElement("div");
+    ariaWrap.className = "ghsub";
+    var ariaHead = document.createElement("div");
+    ariaHead.className = "dim";
+    ariaHead.textContent = "本地 aria2（载荷由伴生脚本代发；下面这几项改过会被记住）";
+    ariaWrap.appendChild(ariaHead);
+    function ariaField(label, key, value, placeholder, type) {
+      var lab = document.createElement("label");
+      lab.appendChild(document.createTextNode(label));
+      var inp = document.createElement("input");
+      inp.type = type || "text"; inp.name = "ghf_" + key;
+      inp.placeholder = placeholder || ""; inp.value = value || "";
+      lab.appendChild(inp);
+      ariaWrap.appendChild(lab);
+      return inp;
+    }
+    var ariaRpcIn = ariaField("RPC 地址", "aria_rpc", aria0.rpc, "http://127.0.0.1:6800/jsonrpc");
+    var ariaSecretIn = ariaField("RPC 密钥（--rpc-secret，留空=无）", "aria_secret", aria0.secret, "留空 = 无密钥", "password");
+    var ariaDirIn = ariaField("下载目录 dir（aria2 那台机器上的绝对路径，留空=它自己的默认目录）", "aria_dir", aria0.dir, "D:\\Downloads");
+    var ariaMultiLab = document.createElement("label");
+    var ariaMultiIn = document.createElement("input");
+    ariaMultiIn.type = "checkbox"; ariaMultiIn.name = "ghf_aria_multi";
+    ariaMultiIn.checked = aria0.multi;
+    ariaMultiLab.appendChild(ariaMultiIn);
+    ariaMultiLab.appendChild(document.createTextNode(" 多连接加速（-x 16 -s 16）"));
+    ariaWrap.appendChild(ariaMultiLab);
+    var ariaOwLab = document.createElement("label");
+    var ariaOwIn = document.createElement("input");
+    ariaOwIn.type = "checkbox"; ariaOwIn.name = "ghf_aria_ow";
+    ariaOwIn.checked = store.get("one_aria_ow", "0") === "1";
+    ariaOwLab.appendChild(ariaOwIn);
+    ariaOwLab.appendChild(document.createTextNode(" 覆盖已存在文件（allow-overwrite）"));
+    ariaWrap.appendChild(ariaOwLab);
+    box.appendChild(ariaWrap);
+
+    /* ---------- MediaGo 专用 ---------- */
+    var mgWrap = document.createElement("div");
+    mgWrap.className = "ghsub";
+    var mgHead = document.createElement("div");
+    mgHead.className = "dim";
+    mgHead.textContent = "MediaGo（桌面端 39719，Docker 通常 9900；载荷由伴生脚本代发）";
+    mgWrap.appendChild(mgHead);
+    function mgField(label, key, value, placeholder, type) {
+      var lab = document.createElement("label");
+      lab.appendChild(document.createTextNode(label));
+      var inp = document.createElement("input");
+      inp.type = type || "text"; inp.name = "ghf_" + key;
+      inp.placeholder = placeholder || ""; inp.value = value || "";
+      lab.appendChild(inp);
+      mgWrap.appendChild(lab);
+      return inp;
+    }
+    var mgBaseIn = mgField("MediaGo 地址", "mg_base", mg0.base, "http://127.0.0.1:9900");
+    var mgKeyIn = mgField("API Key（留空=无认证）", "mg_key", mg0.key, "留空 = 无认证", "password");
+    var mgFolderIn = mgField("保存子目录 folder（留空=MediaGo 默认目录）", "mg_folder", mg0.folder, "videos");
+    var mgDelLab = document.createElement("label");
+    var mgDelIn = document.createElement("input");
+    mgDelIn.type = "checkbox"; mgDelIn.name = "ghf_mg_del";
+    mgDelIn.checked = mg0.del;
+    mgDelLab.appendChild(mgDelIn);
+    mgDelLab.appendChild(document.createTextNode(" 合并后删除 .ts 分段（deleteSegments）"));
+    mgWrap.appendChild(mgDelLab);
+    box.appendChild(mgWrap);
+
     var hfHint = document.createElement("div");
     hfHint.className = "dim";
     box.appendChild(hfHint);
 
     var hLab = document.createElement("label");
     hLab.appendChild(document.createTextNode(
-      "请求头 headers（UA 与来源已按当前页面填在这一栏里 —— 这栏就是最终发出去的那份，删掉一条就不带一条）"));
+      "请求头 headers（UA 与来源已按当前页面填在这一栏里 —— 这栏就是最终发出去的那份，删掉一条就不带一条；本地那两个出口也用这一份）"));
     var hIn = document.createElement("input");
     hIn.type = "text"; hIn.name = "ghf_headers";
     hIn.placeholder = '{"User-Agent":"…","Referer":"…","Cookie":"…"}';
@@ -1733,27 +2172,62 @@
     row.className = "ghrow";
     var go = document.createElement("button");
     go.setAttribute("data-ghact", "go");
-    go.textContent = "✓ 确认触发";
+    go.textContent = "✓ 确认发送";
     var cancel = document.createElement("button");
     cancel.setAttribute("data-ghact", "cancel");
     cancel.textContent = "取消";
     row.appendChild(go); row.appendChild(cancel);
     box.appendChild(row);
 
+    function targets() {
+      return { gh: !tGh.disabled && tGh.checked, aria: !tAria.disabled && tAria.checked,
+               mg: !tMg.disabled && tMg.checked };
+    }
+    function anyTarget() { var t = targets(); return t.gh || t.aria || t.mg; }
+
     /* 换选哪条时：没动过的文件名按新那条重算默认，动过的只把后缀按新格式改回来，
-       免得用户手打的「我的名字」一radio 就没了 */
+       免得用户手打的「我的名字」一radio 就没了。
+       每个出口都有自己的「名字规则」，提示与框里的值必须跟着「当前实际要发的出口」走：
+       GitHub 的 M3U8 不带后缀、aria2 是 -o 原样落盘、MediaGo 的 name 不带后缀。 */
+    function nameFor(fmt, stem) {
+      var t = targets();
+      if (t.gh) return ghName(sanitizeFileName(stem), fmt);
+      if (t.aria) return ariaOutName(sanitizeFileName(stem), fmt);
+      return sanitizeFileName(stem);
+    }
     function syncForm() {
       var it = chosen(), isHls = it.fmt === "M3U8";
-      muxLab.style.display = isHls ? "" : "none";
+      var t = targets(), lcl = t.aria || t.mg;
+      /* 只勾本地出口时，GitHub 那一串设置不该占地方 */
+      muxLab.style.display = (t.gh && isHls) ? "" : "none";
+      hfLab.style.display = t.gh ? "" : "none";
+      pathLab.style.display = t.gh ? "" : "none";
+      hfHint.style.display = t.gh ? "" : "none";
+      ariaWrap.style.display = t.aria ? "" : "none";
+      mgWrap.style.display = t.mg ? "" : "none";
+
       var stem = nameDirty ? ghSplitExt(nameIn.value).stem : ghDefaultStem(it, title);
-      nameIn.value = ghName(sanitizeFileName(stem), it.fmt);
-      nameAutoExt = it.fmt !== "M3U8" && !ghSplitExt(stem).ext;
-      hint.textContent = isHls
-        ? "M3U8 → m3u8.yml：save_name 不带后缀（RE 按 mux_format 自己补），清单里的 params 有时效，触发后别让 runner 排太久"
-        : "MP4 → aria2.yml：save_name 就是最终文件名，没写后缀会自动补 .mp4";
+      nameIn.value = nameFor(it.fmt, stem);
+      nameAutoExt = t.gh && it.fmt !== "M3U8" && !ghSplitExt(stem).ext;
+
+      var bits = [];
+      if (t.gh) {
+        bits.push(isHls
+          ? "GitHub m3u8.yml：save_name 不带后缀（RE 按 mux_format 自己补），清单里的 params 有时效，触发后别让 runner 排太久"
+          : "GitHub aria2.yml：save_name 就是最终文件名，没写后缀会自动补 .mp4");
+      }
+      if (t.aria) {
+        bits.push(isHls
+          ? "aria2：原版不解析 HLS，这条 .m3u8 多半只会下到播放列表本身（要分片得用支持 HLS 的 aria2 构建）"
+          : "aria2：out 就是这个文件名（-o 原样落盘，没后缀会自动补 .mp4）");
+      }
+      if (t.mg) bits.push("MediaGo：name 不带后缀，后缀按链接类型由它自己补");
+      if (!bits.length) bits.push("⚠ 一个出口都没勾 —— 勾上至少一个才能发");
+      hint.textContent = bits.join("；");
+
       var dir = ghHfPath(pathIn.value);
       /* 这里现读一次 ⚙，不用开单子时那份快照：单子开着的时候人也能去上面改 hf_repo，
-         提示写的落点必须和「✓ 确认触发」真正发出去的那一份一致 */
+         提示写的落点必须和「✓ 确认发送」真正发出去的那一份一致 */
       var hfNow = ghHfCfg();
       hfHint.textContent = hfIn.checked
         ? "传到 " + (hfNow.repo
@@ -1761,18 +2235,27 @@
             : "（⚙ 里没填 hf_repo，改用仓库 Secret ARIA2_HF_REPO / M3U8_HF_REPO 兜底；Secret 也没有就只下载不上传）") +
           " —— HF 的 token 只存在那个仓库的 Secret 里，这张单子上不填、脚本也拿不到"
         : "不勾就只在 Actions 那次运行的 artifacts 里取；上传目录现在填的是「" + (dir || "（空）") + "」，改过一次就会被记住，下次开单子自动带回";
+      if (lcl && !hasLcl) hint.textContent += "；⚠ 本地转发脚本没装，这两条发不出去";
+      go.disabled = !anyTarget();
+      go.textContent = anyTarget() ? "✓ 确认发送" : "✓ 先勾一个出口";
     }
     nameIn.addEventListener("input", function () { nameDirty = true; nameAutoExt = false; });
     Array.prototype.forEach.call(links.querySelectorAll("input[type=radio]"), function (r) {
       r.addEventListener("change", syncForm);
     });
-    hfIn.addEventListener("change", syncForm);
+    [tGh, tAria, tMg, hfIn, ariaMultiIn, mgDelIn].forEach(function (c) {
+      c.addEventListener("change", syncForm);
+    });
     pathIn.addEventListener("input", syncForm);
     go.addEventListener("click", function () {
       var it = chosen();
-      var raw = nameIn.value;                       // 原样交给 sendToAction：后缀是不是用户自己写的，它要在面板上说明白
-      var nm = ghName(sanitizeFileName(raw), it.fmt);
-      if (!nm) { log("文件名空着没法下（aria2 的 -o、RE 的 --save-name 都拿它当名字），填一个或清空让它回到默认。", "bad"); return; }
+      var t = targets();
+      if (!anyTarget()) { log("一个出口都没勾：勾上 GitHub / 本地 aria2 / MediaGo 里至少一个再确认。", "bad"); return; }
+      var raw = nameIn.value;                       // 原样交下去：后缀是不是用户自己写的，那边要在面板上说明白
+      if (t.gh && !ghName(sanitizeFileName(raw), it.fmt)) {
+        log("文件名空着没法交给 GitHub（aria2.yml 的 -o、RE 的 --save-name 都拿它当名字），填一个或清空让它回到默认。", "bad");
+        return;
+      }
       var hs = String(hIn.value || "").trim();
       if (hs && !/^\{/.test(hs)) {
         log("headers 得是一行 JSON 对象（例：{\"Cookie\":\"…\"}），这栏写坏了 —— 这次按刚铺好的那份（自动的 UA 与来源）发。", "bad");
@@ -1782,9 +2265,21 @@
       store.set("one_gh_mux", muxIn.checked ? "1" : "0");
       store.set("one_gh_hf", hfIn.checked ? "1" : "0");
       store.set("one_gh_hf_path", dir);             // 目录只认这一个键：⚙ 里看到的默认值就是上次在这张单子上填的
+      /* 本地那几栏也记住：RPC 地址/密钥/目录、MediaGo 地址/Key/子目录，都是「下次还用这一台」的东西 */
+      store.set("one_aria_rpc", String(ariaRpcIn.value || "").trim() || "http://127.0.0.1:6800/jsonrpc");
+      store.set("one_aria_secret", String(ariaSecretIn.value || "").trim());
+      store.set("one_aria_dir", String(ariaDirIn.value || "").trim());
+      store.set("one_aria_multi", ariaMultiIn.checked ? "1" : "0");
+      store.set("one_aria_ow", ariaOwIn.checked ? "1" : "0");
+      store.set("one_mg_base", String(mgBaseIn.value || "").trim() || "http://127.0.0.1:9900");
+      store.set("one_mg_key", String(mgKeyIn.value || "").trim());
+      store.set("one_mg_folder", String(mgFolderIn.value || "").trim());
+      store.set("one_mg_del", mgDelIn.checked ? "1" : "0");
+      store.set("one_dl_targets", DL_TARGETS.filter(function (k) { return t[k]; }).join(","));
       closeGhForm();
-      sendToAction(res, { item: it, name: raw, headers: hs, mux: muxIn.checked, autoExt: nameAutoExt,
-                          hf: hfIn.checked, hfPath: dir });
+      sendToTargets(res, { item: it, name: raw, headers: hs, mux: muxIn.checked, autoExt: nameAutoExt,
+                           hf: hfIn.checked, hfPath: dir, targets: t,
+                           overwrite: ariaOwIn.checked });
       if (isOpen()) placeBody();
     });
     cancel.addEventListener("click", function () {
@@ -1828,7 +2323,7 @@
         '<button data-act="cap" title="显示拦截到的 App 请求与响应">看拦截</button>' +
         '<button data-act="diag" title="检查钩子装在哪个世界、为何拦不到">诊断</button>' +
         '<button data-act="copy" title="复制上一次解密出的 JSON">复制 JSON</button>' +
-        '<button data-act="dl" title="把刚拿到的链接交给本仓库的 Actions：MP4 走 aria2.yml，M3U8 走 m3u8.yml">⬇</button>' +
+        '<button data-act="dl" title="把刚拿到的链接先填一张单子，再发出去：可勾 GitHub Actions（MP4→aria2.yml，M3U8→m3u8.yml）、本地 aria2、MediaGo，勾几个发几个">⬇</button>' +
         '<button data-act="cfg" title="切换配置">⚙</button>' +
         '<button data-act="close" title="收起（也可以再点一次悬浮球）">收起 ✕</button>' +
       '</div>' +
@@ -1846,7 +2341,7 @@
         '<label>模块 token（会覆盖内置值，换 exp 后粘新的）<input name="token" placeholder="eyJ0eXAiOiJKV1Qi…"></label>' +
         '<label>指定 api 域（留空=自动，优先用拦截到的域，再退 localStorage.current_domain 与种子池）<input name="host" placeholder="https://api.61c76a0.com"></label>' +
         '<label>播放域名（留空=自动：先取页面自己正在播的那次请求的域，再退媒体池种子。它和请求体里的 ts 域名 dn 不是一回事）<input name="play" placeholder="https://z4bey8.bx7qxb.com"></label>' +
-        '<div class="dim" style="margin-top:8px">GitHub 下载（⬇ 那个按钮先在面板里铺一张单子：选哪条链接、文件名、请求头、要不要传 HF，确认后才投给本仓库的 Actions：MP4→aria2.yml，M3U8→m3u8.yml。下面这几项是那张单子的默认值）</div>' +
+        '<div class="dim" style="margin-top:8px">GitHub 下载（⬇ 那个按钮先在面板里铺一张单子：选哪条链接、发到哪、文件名、请求头、要不要传 HF，确认后才发。GitHub 这条：MP4→aria2.yml，M3U8→m3u8.yml。下面这几项是那张单子的默认值）</div>' +
         '<label>仓库 owner/repo<input name="gh_repo" placeholder="owner/gh-toolbox"></label>' +
         '<label>分支 ref<input name="gh_ref" placeholder="main"></label>' +
         '<label>下载格式（单子里默认选中哪一条）<select name="gh_fmt">' +
@@ -1866,8 +2361,24 @@
         '<div class="dim">Token 只用来触发 workflow 和查自己那次的运行状态。本脚本是 @grant none，' +
         '它和这里填的东西都存在 j7tu.com 这个站点的 localStorage 里（不是 Tampermonkey 的存储），' +
         '所以请只用一个「只授权这一个仓库、只给 Actions: write」的 fine-grained token，别拿账号级 PAT。</div>' +
+        '<div class="dim" style="margin-top:8px">本地出口：aria2 / MediaGo（同样在单子里勾，下面这几栏是默认值，单子上改了也记住同一个键）。' +
+        '这两条要打 127.0.0.1 或局域网地址，而本脚本是 @grant none（拦 App 请求靠的就是它），页面里的 fetch 打不通常见被 CORS / ' +
+        '私有网络策略挡住 —— 所以请求交给伴生脚本 one-local-dispatch.user.js 代发。没装它的时候这两个勾是灰的，面板会写明原因。</div>' +
+        '<label>aria2 RPC 地址<input name="aria_rpc" placeholder="http://127.0.0.1:6800/jsonrpc"></label>' +
+        '<label>aria2 RPC 密钥（--rpc-secret，留空=无）<input name="aria_secret" type="password" placeholder="留空 = 无密钥"></label>' +
+        '<label>aria2 下载目录 dir（aria2 那台机器上的绝对路径，留空=它自己的默认目录）<input name="aria_dir" placeholder="D:\\Downloads"></label>' +
+        '<label>aria2 代理 all-proxy（留空=直连）<input name="aria_proxy" placeholder="http://127.0.0.1:7890"></label>' +
+        '<label class="auto"><input type="checkbox" name="aria_multi"> aria2 默认多连接（-x 16 -s 16）</label>' +
+        '<label>MediaGo 地址<input name="mg_base" placeholder="http://127.0.0.1:9900"></label>' +
+        '<label>MediaGo API Key（Docker 认证时填，留空=无认证）<input name="mg_key" type="password" placeholder="留空 = 无认证"></label>' +
+        '<label>MediaGo 保存子目录 folder（留空=它配置里的默认目录）<input name="mg_folder" placeholder="videos"></label>' +
+        '<label class="auto"><input type="checkbox" name="mg_del"> MediaGo 默认合并后删除 .ts 分段（deleteSegments）</label>' +
+        '<div style="display:flex;gap:6px;margin-top:6px">' +
+          '<button type="button" data-lcltest="aria">测试 aria2 连接</button>' +
+          '<button type="button" data-lcltest="mg">测试 MediaGo 连接</button></div>' +
+        '<div class="dim" data-lclstate></div>' +
         '<div class="dim" style="margin-top:6px">detail 只是读：本脚本不调用 purchase/buy，不扣币，不取流；' +
-        '下载由你在 Actions 里主动触发，跑在你自己的仓库上。</div>' +
+        '下载由你主动触发 —— GitHub 那条跑在你自己的仓库上，本地两条跑在你自己的 aria2 / MediaGo 上。</div>' +
       '</div>' +
       '<div class="panel"></div>';
     (document.body || document.documentElement).appendChild(hostDiv);
@@ -1919,6 +2430,76 @@
     cfgBox.querySelector("input[name=gh_hf_repo]").value = store.get("one_gh_hf_repo", "");
     cfgBox.querySelector("input[name=gh_hf_path]").value = store.get("one_gh_hf_path", "");
     cfgBox.querySelector("input[name=gh_hf_on]").checked = ghHfCfg().on;
+    cfgBox.querySelector("input[name=aria_rpc]").value = ariaCfg().rpc;
+    cfgBox.querySelector("input[name=aria_secret]").value = ariaCfg().secret;
+    cfgBox.querySelector("input[name=aria_dir]").value = ariaCfg().dir;
+    cfgBox.querySelector("input[name=aria_proxy]").value = ariaCfg().proxy;
+    cfgBox.querySelector("input[name=aria_multi]").checked = ariaCfg().multi;
+    cfgBox.querySelector("input[name=mg_base]").value = mgCfg().base;
+    cfgBox.querySelector("input[name=mg_key]").value = mgCfg().key;
+    cfgBox.querySelector("input[name=mg_folder]").value = mgCfg().folder;
+    cfgBox.querySelector("input[name=mg_del]").checked = mgCfg().del;
+
+    /* 测试连接：链路是两段（伴生脚本在不在 → 本地服务通不通），分开报，一眼能看出卡在哪段。
+       这里用面板里「当前填的值」，不读 store —— 刚改完还没触发 change 时也该按新值测。 */
+    Array.prototype.forEach.call(cfgBox.querySelectorAll("[data-lcltest]"), function (btn) {
+      btn.addEventListener("click", function () {
+        var which = btn.getAttribute("data-lcltest");
+        var val = function (n) { var e2 = cfgBox.querySelector("input[name=" + n + "]"); return e2 ? String(e2.value || "").trim() : ""; };
+        if (!lclVersion()) {
+          log("× 测试失败：没检测到本地转发脚本 —— 先装 tools/one/one-local-dispatch.user.js 再刷新本页。" +
+              "本脚本是 @grant none，自己发不了 127.0.0.1 的请求。", "bad");
+          return;
+        }
+        if (which === "aria") {
+          var rpc = val("aria_rpc") || "http://127.0.0.1:6800/jsonrpc";
+          log("aria2 测试   RPC " + rpc + " …", "dim");
+          lclCall("aria2.call", { rpc: rpc, secret: val("aria_secret"), method: "aria2.getVersion", params: [] })
+            .then(function (v) {
+              v = v || {};
+              var feats = Array.isArray(v.enabledFeatures) ? v.enabledFeatures : [];
+              var hls = feats.some(function (f) { return /HLS/i.test(f); });
+              log("✓ aria2 连上了：" + (v.product || "aria2") + " " + v.version +
+                  (hls ? "（支持 HLS）" : "（不支持 HLS —— .m3u8 只会下到播放列表本身）"), hls ? "ok" : "dim");
+            }, function (e) {
+              log("× aria2 测试失败：" + String(e && e.message || e) +
+                  " —— 确认 aria2c 带 --enable-rpc 启动，地址/端口/密钥对得上（局域网还要带 --rpc-allow-origin-all 或允许内网访问）", "bad");
+            });
+        } else {
+          var base = val("mg_base") || "http://127.0.0.1:9900";
+          log("MediaGo 测试  " + base + " …", "dim");
+          lclCall("mediago.call", { base: base, key: val("mg_key"), method: "GET",
+                                   path: "/api/downloads?current=1&pageSize=1" })
+            .then(function (d) {
+              var total = d && typeof d.total === "number" ? d.total : null;
+              log("✓ MediaGo 连上了：" + base + (total === null ? "" : "（当前 " + total + " 个任务）"), "ok");
+            }, function (e) {
+              log("× MediaGo 测试失败：" + String(e && e.message || e) +
+                  " —— 确认 MediaGo 已启动、地址/端口对（桌面端 39719，Docker 常 9900），Docker 开了认证时要填 API Key", "bad");
+            });
+        }
+      });
+    });
+    /* 本地转发脚本在不在，是「这两个勾亮不亮」的唯一依据：写在这里省得每次开单子才发现没装 */
+    function syncLclState() {
+      var pv = cfgBox.querySelector("[data-lclstate]");
+      if (!pv) return;
+      var v = lclVersion();
+      pv.textContent = v
+        ? "本地转发脚本在线（v" + v + "）：⬇ 单子里的 aria2 / MediaGo 两个勾可用"
+        : "⚠ 没检测到本地转发脚本：⬇ 单子里 aria2 / MediaGo 两个勾是灰的。装 tools/one/one-local-dispatch.user.js（带 GM_xmlhttpRequest）" +
+          "后刷新本页即可 —— 本脚本是 @grant none，自己打不通 127.0.0.1";
+      pv.className = v ? "dim" : "bad";
+    }
+    syncLclState();
+    /* 伴生脚本也可能比本脚本晚一点就绪（两个都是 document-start，谁先谁后不定）：
+       盯一下就绪属性，它一出现就把 ⚙ 里那句话和 ⬇ 单子的可勾状态跟上。 */
+    try {
+      if (typeof MutationObserver === "function") {
+        new MutationObserver(syncLclState).observe(document.documentElement,
+          { attributes: true, attributeFilter: [LCL_READY] });
+      }
+    } catch (e) {}
     /* ⚙ 里当场写出「单子的 headers 栏会铺成哪一份」：UA 与来源是每次开单子按当前页面算的，
        所以这里只是给你看一眼最终那串长什么样，存的仍然只有你额外要带的那几条。 */
     function syncHdrPrev() {
@@ -1985,6 +2566,35 @@
           store.set("one_gh_hf", el.checked ? "1" : "0");
           log(el.checked ? "单子里的「☁ 传到 HF」默认勾上" : "单子里的「☁ 传到 HF」默认不勾", "dim");
         }
+        if (k === "aria_rpc") {
+          var rpc = String(el.value || "").trim();
+          if (rpc && !/^https?:\/\//i.test(rpc)) {
+            el.value = store.get("one_aria_rpc", ariaCfg().rpc);
+            log("aria2 RPC 地址得是 http:// 或 https:// 开头，已退回上一个值", "bad");
+          } else {
+            var rpcv = rpc || "http://127.0.0.1:6800/jsonrpc";
+            store.set("one_aria_rpc", rpcv); el.value = rpcv;
+            log("aria2 RPC 已存为 " + rpcv, "dim");
+          }
+        }
+        if (k === "aria_secret") { store.set("one_aria_secret", el.value.trim()); log("aria2 RPC 密钥已保存" + (el.value.trim() ? "" : "（空 = 无密钥）"), "dim"); }
+        if (k === "aria_dir") { store.set("one_aria_dir", el.value.trim()); log("aria2 下载目录已存为 " + (el.value.trim() || "（留空 = aria2 自己的默认目录）"), "dim"); }
+        if (k === "aria_proxy") { store.set("one_aria_proxy", el.value.trim()); log("aria2 代理已存为 " + (el.value.trim() || "（留空 = 直连）"), "dim"); }
+        if (k === "aria_multi") { store.set("one_aria_multi", el.checked ? "1" : "0"); log(el.checked ? "aria2 默认多连接（-x 16 -s 16）" : "aria2 默认单连接", "dim"); }
+        if (k === "mg_base") {
+          var mb2 = String(el.value || "").trim();
+          if (mb2 && !/^https?:\/\//i.test(mb2)) {
+            el.value = store.get("one_mg_base", mgCfg().base);
+            log("MediaGo 地址得是 http:// 或 https:// 开头，已退回上一个值", "bad");
+          } else {
+            var mbv = mb2 || "http://127.0.0.1:9900";
+            store.set("one_mg_base", mbv); el.value = mbv;
+            log("MediaGo 地址已存为 " + mbv, "dim");
+          }
+        }
+        if (k === "mg_key") { store.set("one_mg_key", el.value.trim()); log("MediaGo API Key 已保存" + (el.value.trim() ? "" : "（空 = 无认证）"), "dim"); }
+        if (k === "mg_folder") { store.set("one_mg_folder", el.value.trim()); log("MediaGo 子目录已存为 " + (el.value.trim() || "（留空 = 它自己的默认目录）"), "dim"); }
+        if (k === "mg_del") { store.set("one_mg_del", el.checked ? "1" : "0"); log(el.checked ? "MediaGo 合并后删除 .ts 分段" : "MediaGo 保留 .ts 分段", "dim"); }
         if (k === "mode" || k === "token") armReplace();     // 身份来源变了，DOM 桥要跟着刷新
         if (k !== "mode") return;
         reset();
@@ -2003,7 +2613,7 @@
       else if (act === "copy") copyJson();
       else if (act === "dl") { var ds = detailSource(); if (!ds) reset(); openBody(); openGhForm(ds); }
       else if (act === "close") closeBody();
-      else { cfgBox.classList.toggle("on"); placeBody(); }
+      else { cfgBox.classList.toggle("on"); syncLclState(); placeBody(); }
       if (isOpen()) placeBody();
     });
     /* 展开体上的滚动/触摸不要漏给下层页面，否则在 Flutter 画布上滑动会变成页面自己在动 */

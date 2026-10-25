@@ -10,7 +10,7 @@ GitHub Actions 驱动的工具箱：仓库下每个工具 = 一个自包含的 P
 | `m3u8` | N_m3u8DL-RE 下载 HLS(m3u8)/DASH(mpd) 流 | `.github/workflows/m3u8.yml` | `tools/m3u8/download.py` |
 | `aria2` | aria2c 多连接加速下载直链文件 | `.github/workflows/aria2.yml` | `tools/aria2/download.py` |
 | `qinglong` | 托管青龙面板，控制端口经 CF Tunnel 映射访问 | `.github/workflows/qinglong.yml` | `tools/qinglong/run_panel.py` |
-| `one` | 「ONE/暮色」网页版(j7tu.com)详情页取数器：拦页面自己发出的 detail 请求还原文章 id，换 one 模块 token 重取详情并铺出 MP4/M3U8 完整链接，点 ⬇ 填一张单子（选哪条链接、文件名、headers、M3U8 要不要转 MP4、勾一下就顺带传到 HF 数据集）再投给本仓库的 workflow 下载 | 无（脚本自己不挂 workflow；面板 ⬇ 触发 `aria2.yml` / `m3u8.yml`） | `tools/one/one-detail-fetcher.user.js` |
+| `one` | 「ONE/暮色」网页版(j7tu.com)详情页取数器：拦页面自己发出的 detail 请求还原文章 id，换 one 模块 token 重取详情并铺出 MP4/M3U8 完整链接，点 ⬇ 填一张单子（选哪条链接、发到哪、文件名、headers、M3U8 要不要转 MP4、勾一下就顺带传到 HF 数据集）再发出去 —— 可发 GitHub workflow，也可发本地 aria2 / MediaGo（后者由伴生脚本 `one-local-dispatch.user.js` 代发） | 无（脚本自己不挂 workflow；面板 ⬇ 触发 `aria2.yml` / `m3u8.yml`） | `tools/one/one-detail-fetcher.user.js`（+ 可选 `tools/one/one-local-dispatch.user.js`） |
 
 ## 通用约定
 
@@ -49,7 +49,8 @@ GitHub Actions 驱动的工具箱：仓库下每个工具 = 一个自包含的 P
 │   │   ├── bin/                   # cloudflared 二进制（gitignore，按需下载）
 │   │   └── cloudflared.log        # cloudflared 日志（gitignore，含隧道地址）
 │   └── one/
-│       └── one-detail-fetcher.user.js # 油猴脚本：j7tu.com 详情页取数器（无 Python 入口；⬇ 可触发 aria2.yml / m3u8.yml）
+│       ├── one-detail-fetcher.user.js # 油猴脚本：j7tu.com 详情页取数器（无 Python 入口；⬇ 可触发 aria2.yml / m3u8.yml）
+│       └── one-local-dispatch.user.js # 伴生脚本（可选）：带 GM_xmlhttpRequest，替主脚本把下载任务发给本地 aria2 / MediaGo
 └── README.md
 ```
 
@@ -658,15 +659,24 @@ CF_MODE=none RUN_MINUTES=0 python tools/qinglong/run_panel.py
 
 ## one 工具说明
 
-「ONE / 暮色」网页版（`https://j7tu.com/#/app`，Flutter Web）的**详情页取数器**油猴脚本（当前 `v2.17.0`）。详情路由是 `#/videoDetail`，文章 id 既不写在 URL 上也不落在 localStorage 里，唯一可靠的来源是 App 自己发出的那次 `POST /v2.5/article/detail` 的请求体（`base64(AES-128-CBC("id=<文章id>&dn=<ts域名>"))`）。脚本在 `document-start` 装上 XHR 钩子，解密请求体还原 id 与 `dn`，记下 App 真正使用的请求头，再用 one 模块 token 重取一次详情，把可点、可选中复制的完整播放链接铺出来；拿到链接后点 ⬇ 会**先铺一张单子**（选哪条链接、文件名、请求头，M3U8 还问要不要转成 MP4，勾一下就顺带把产物传到 Hugging Face 数据集、上传目录可以直接在单子上改），确认了才投给本仓库的 Actions（MP4→`aria2.yml`，M3U8→`m3u8.yml`）。脚本自己没有 Python 入口，也不常驻任何 workflow——下载是你点 ⬇ 再点「✓ 确认触发」才发生的一次手动触发。
+「ONE / 暮色」网页版（`https://j7tu.com/#/app`，Flutter Web）的**详情页取数器**油猴脚本（当前 `v2.18.0`）。详情路由是 `#/videoDetail`，文章 id 既不写在 URL 上也不落在 localStorage 里，唯一可靠的来源是 App 自己发出的那次 `POST /v2.5/article/detail` 的请求体（`base64(AES-128-CBC("id=<文章id>&dn=<ts域名>"))`）。脚本在 `document-start` 装上 XHR 钩子，解密请求体还原 id 与 `dn`，记下 App 真正使用的请求头，再用 one 模块 token 重取一次详情，把可点、可选中复制的完整播放链接铺出来；拿到链接后点 ⬇ 会**先铺一张单子**（选哪条链接、**发到哪**、文件名、请求头，M3U8 还问要不要转成 MP4，勾一下就顺带把产物传到 Hugging Face 数据集、上传目录可以直接在单子上改），确认了才真的发出去。出口有三个，可以只勾一个，也可以一次全勾：
+
+| 出口 | 走什么 | 产物在哪 |
+|---|---|---|
+| GitHub Actions | MP4→`aria2.yml`，M3U8→`m3u8.yml` | 那次运行的 artifacts（勾了 HF 就传到数据集） |
+| 本地 aria2 | aria2 JSON-RPC（`addUri` + `tellStatus` 轮询） | aria2 那台机器上的下载目录 |
+| MediaGo | MediaGo HTTP API（`POST /api/downloads` + 轮询） | MediaGo 配置的保存目录 |
+
+脚本自己没有 Python 入口，也不常驻任何 workflow——下载是你点 ⬇ 再点「✓ 确认发送」才发生的一次手动动作。
 
 ### 安装
 
 1. Tampermonkey / Violentmonkey 新建脚本，把 `tools/one/one-detail-fetcher.user.js` 内容整体粘进去保存（或把文件拖进扩展的「已安装的用户脚本」）。
 2. **`@grant none` 别改**：脚本靠跑在页面主世界才能拦到 App 的请求；改成有 grant 的沙箱形态会退化为「注入回传」，面板会显式说明拦不到。
-3. 打开 `https://j7tu.com/#/app`，右下角出现悬浮球即注入成功（点球展开/收起，球可拖动，位置会被记住）。
-4. 要用 ⬇ 下载才需要这一步：⚙ 最下面那组 GitHub 字段里粘一个 token（**fine-grained，只授权目标仓库、只给 Actions: write**），仓库/分支留默认即可（`owner/gh-toolbox` / `main`）。只取链接不下载就什么都不用填——没 token 时 ⬇ 连单子都不铺，只提示一句「去 ⚙ 填」，一个请求都不发。
-5. 要用「☁ 传到 HF」那一勾，得先在**目标仓库**配 Secret：`ARIA2_HF_TOKEN` / `M3U8_HF_TOKEN`（HF 的 read+write dataset 权限），可选 `ARIA2_HF_REPO` / `M3U8_HF_REPO` 当默认数据集。脚本这边只填「传到哪个仓库、哪个目录」，**不经手 HF token**。
+3. **想发本地 aria2 / MediaGo 就再装一个伴生脚本** `tools/one/one-local-dispatch.user.js`（同样整段粘进 Tampermonkey）。它带 `@grant GM_xmlhttpRequest`，**没有界面、没有存储**，只做一件事：替主脚本把 HTTP 请求发到 `127.0.0.1` / 局域网地址，结果写回 `<html>` 上的属性。装好后刷新页面，⚙ 里会显示「本地转发脚本在线（v1.0.0）」；不装也能用，只是 ⬇ 单子里那两个勾是灰的，面板会写明原因。**为什么非拆成两个**：主脚本是 `@grant none`（拦 App 请求靠的就是它），而页面主世界的 `fetch` 打不通本地端口（CORS + 私有网络策略），只有 `GM_xmlhttpRequest` 能通、但它必须 `@grant`——一加 `@grant` 脚本就进沙箱、拦不到 App。所以特权的部分单独关在一个小脚本里。
+4. 打开 `https://j7tu.com/#/app`，右下角出现悬浮球即注入成功（点球展开/收起，球可拖动，位置会被记住）。
+5. 要用 ⬇ 发 GitHub 才需要这一步：⚙ 那组 GitHub 字段里粘一个 token（**fine-grained，只授权目标仓库、只给 Actions: write**），仓库/分支留默认即可（`owner/gh-toolbox` / `main`）。只取链接、或者只发本地 aria2 / MediaGo，就什么都不用填——没 token 时 GitHub 那个勾是灰的，其余照用。
+6. 要用「☁ 传到 HF」那一勾，得先在**目标仓库**配 Secret：`ARIA2_HF_TOKEN` / `M3U8_HF_TOKEN`（HF 的 read+write dataset 权限），可选 `ARIA2_HF_REPO` / `M3U8_HF_REPO` 当默认数据集。脚本这边只填「传到哪个仓库、哪个目录」，**不经手 HF token**。
 
 ### 怎么用
 
@@ -674,19 +684,37 @@ CF_MODE=none RUN_MINUTES=0 python tools/qinglong/run_panel.py
 - **用模块 token 重取**：面板按钮，用当前「身份模式」再取一次同一 id 的详情，结果按 **正片/预告 × MP4/M3U8 四格**铺出；缺哪一格会写清是服务端没给、还是请求体没带 `dn`。
 - **自动替换页面的 token**（⚙ 设置里的复选框，**默认关**）：开启后 App 自己发出的那些请求（详情/评论/点赞/下载…）在离开浏览器前就把 `token/uuid/user-key/sign/ip` 五个头一起换成所选身份，页面本身直接看到替换后的结果，不用再点按钮；关掉立刻原样放行。开关会被记住，下次进页面自动读回并重新挂载。`/purchase` `/buy` `/pay` `/coin` `/recharge` `/order` `/vip` `/sign_in` **永不替换**。
 - **看拦截 / 诊断 / 复制 JSON**：分别回显拦到的原始请求与响应、钩子装在哪个世界（以及拦不到的原因）、把上一次解密出的 JSON 复制到剪贴板。
-- **⬇ 发到 GitHub 下载**：点一下先在面板里铺出**一张只对本次有效的单子**——① 每条可下载链接一个单选（`正片 MP4 → aria2.yml（域名）` / `正片 M3U8 → m3u8.yml（域名）` / `预告 MP4 → …`，默认选中 ⚙「下载格式」那条）；② `文件名 save_name`；③ 选了 M3U8 才露出「转成 MP4（mux_format=mp4）」复选框，**默认勾着**，不勾就是 `none`（产出分轨原文件，不合成）；④「☁ 传到 HF（hf_upload）」复选框 + 一栏**可改的上传目录 `hf_path`**（勾了才传，目录就是数据集仓库里的子目录，留空=根路径）；⑤ `请求头 headers`（**开单子时就把 `User-Agent` 与来源 `Referer` 写在这栏里**，再加上 ⚙ 里那条额外的，所以栏里看到的这一串就是最终发出去的那一份：改哪条发哪条，删掉哪条就不带哪条，整栏清空就是这次不带自定义头）。改完点「✓ 确认触发」才发，点「取消」一个字都不发。面板随后逐行回显：用的哪份详情、这次可选哪几条、选了哪条（写明是「面板上选的」还是「格式设置：auto」）、`POST owner/repo / workflow ref=分支`、发出去的 `urls` / `save_name` / `mux_format` / `headers` / `hf_upload`，然后是 204、认出的那次运行（带可点链接）、每 5 秒刷一次的状态，直到 success/失败。
-- **⚙ 里那组 GitHub / HF 字段 = 单子的默认值**：仓库、分支、下载格式（决定单子里默认选中哪一条）、GitHub token、额外请求头（**这里只存你额外要带的那几条**，`User-Agent` 与来源不落盘——落盘了就是一份迟早过期的 UA，理由见下条），加上 Hugging Face 三项——数据集仓库 ID（`owner/name`，直接粘 `https://huggingface.co/datasets/...` 也认；留空=用仓库 Secret 兜底）、上传目录默认值、以及「默认勾上 ☁ 传到 HF」。那两个勾和目录与单子写回的是同一批键（`one_gh_hf` / `one_gh_hf_path` / `one_gh_mux`），所以在单子上改过一次，⚙ 里下次打开看到的就是它，两边不会各存一份对不上。
+- **⬇ 发出去下载**：点一下先在面板里铺出**一张只对本次有效的单子**——① 每条可下载链接一个单选（`正片 MP4（域名）` / `正片 M3U8（域名）` / `预告 MP4（域名）`，默认选中 ⚙「下载格式」那条）；② **「发送到哪」一排勾**：GitHub Actions / 本地 aria2 / MediaGo，勾几个就发几次（互不影响，一次全勾也行）；③ `文件名 save_name`；④ 勾了 GitHub 且选了 M3U8 才露出「转成 MP4（mux_format=mp4）」复选框，**默认勾着**，不勾就是 `none`（产出分轨原文件，不合成）；⑤ 勾了 GitHub 才露出「☁ 传到 HF（hf_upload）」复选框 + 一栏**可改的上传目录 `hf_path`**（勾了才传，目录就是数据集仓库里的子目录，留空=根路径）；⑥ 勾了本地 aria2 才露出 RPC 地址/密钥/下载目录/多连接/覆盖；⑦ 勾了 MediaGo 才露出服务地址/API Key/保存子目录/删除分段；⑧ `请求头 headers`（**开单子时就把 `User-Agent` 与来源 `Referer` 写在这栏里**，再加上 ⚙ 里那条额外的，所以栏里看到的这一串就是最终发出去的那一份：改哪条发哪条，删掉哪条就不带哪条，整栏清空就是这次不带自定义头；**三个出口共用这一栏**）。改完点「✓ 确认发送」才发，点「取消」一个字都不发。面板随后逐行回显每个出口实际发了什么，以及进度（GitHub 是运行状态，aria2 是百分比/速度/落盘路径，MediaGo 是任务状态/产物文件名）。
+- **⚙ 里那组 GitHub / HF / 本地字段 = 单子的默认值**：仓库、分支、下载格式（决定单子里默认选中哪一条）、GitHub token、额外请求头（**这里只存你额外要带的那几条**，`User-Agent` 与来源不落盘——落盘了就是一份迟早过期的 UA，理由见下条），加上 Hugging Face 三项——数据集仓库 ID（`owner/name`，直接粘 `https://huggingface.co/datasets/...` 也认；留空=用仓库 Secret 兜底）、上传目录默认值、以及「默认勾上 ☁ 传到 HF」；再加上本地出口那一组——aria2 RPC 地址 / RPC 密钥 / 下载目录 / all-proxy / 默认多连接，MediaGo 地址 / API Key / 保存子目录 / 默认删分段，以及两个「测试连接」按钮（分别用 `aria2.getVersion` 与 `GET /api/downloads` 探活，失败时把常见原因直接写在面板上）。这些勾和输入框与单子写回的是同一批键（`one_aria_*` / `one_mg_*` / `one_gh_hf` / `one_gh_hf_path` / `one_gh_mux` / `one_dl_targets`），所以在单子上改过一次，⚙ 里下次打开看到的就是它，两边不会各存一份对不上。
+
+### 本地 aria2 / MediaGo 出口（v2.18）
+
+单子上「发送到哪」那排勾里的后两个，不经过 GitHub，直接把地址交给本机的下载器。链路是两段的，⚙ 里写着它现在是哪一段：
+
+1. **主脚本 → 伴生脚本**：`<html>` 上的 `data-oneqz-local` 属性（一个只增的队列，每条带唯一 id）——和「自动替换 token」用的 `data-oneqz-repl` 同一套跨世界桥法。只用字符串，不跨 realm 传对象，所以 Chrome / Firefox 都不会踩 `Permission denied`。
+2. **伴生脚本 → 本地服务**：`GM_xmlhttpRequest`（绕开同源与私有网络限制），回应写到 `data-oneqz-local-res`，主脚本按 id 认领。
+
+具体行为：
+
+- **aria2**：`aria2.addUri`，选项包括 `out`（就是单子上那个文件名，MP4 没后缀自动补 `.mp4`；M3U8 用 `.m3u8`）、`dir`（下载目录）、`header`（单子那一栏的 headers，逐条 `Name: Value`）、`all-proxy`、`allow-overwrite`、`auto-file-renaming=false`；勾了多连接再加 `split=16` / `max-connection-per-server=16` / `min-split-size=1M`。拿到 gid 就返回，进度在后台用 `aria2.tellStatus` 每 3 秒刷（状态 / 百分比 / 速度 / 落盘路径），面板只在状态、5% 档位或「在不在跑」变化时才写一行。
+- **MediaGo**：`POST /api/downloads`，`tasks: [{ type, url, name, folder, headers, deleteSegments }]` + `startDownload: true`；`type` 按链接判定（`.m3u8` → `m3u8`，其余 → `direct`）。`name` **不带后缀**（后缀由 MediaGo 按类型补）。拿到任务 id 后用 `GET /api/downloads/<id>` 轮询状态（等待中 / 下载中 / 完成 / 失败 / 已停止 / 产物文件名）。
+- **不需要选画质**：这里发的是详情接口给出的那条具体清单（`/api/video/getM3u8.m3u8?params=…`），不是多码率 master，所以没有「选哪一档」这回事——和 `m3u8-dispatch.user.js` 在视频站抓到的 master 播放列表不同，那里必须先选流再发。
+- **三个出口互不排队**：勾全了也是每个出口各自下发，本地两条拿到任务 id 就返回（进度转后台），不会因为 GitHub 那边要排队几分钟而让 aria2 迟迟不动。两个本地出口的轮询各有各的代次号，再发一次 aria2 不会把 MediaGo 的轮询掐掉。
+- **aria2 原版不解析 HLS**：勾了 aria2 又选了 M3U8 时，面板会明确写一句「这条多半只会下到播放列表本身」，要分片得用 `aria2-next` 之类支持 HLS 的构建，或者改发 GitHub 的 `m3u8.yml` / MediaGo。「测试连接」也会报「支持 / 不支持 HLS」。
+- **伴生脚本没装时不骗人**：⚙ 里写「⚠ 没检测到本地转发脚本」，⬇ 单子里那两个勾是灰的、并写明原因；诊断里也有一行「本地转发 …」。装好后刷新一次页面即可（元数据只在安装时读，`@match` 是 `j7tu.com`）。
+
+> **安全边界（这条得说清）**：主脚本跑在页面主世界，它写在 `<html>` 上的东西 `j7tu.com` 自己的 JS 也看得见、也能往里塞请求。所以伴生脚本并不能做到「只有主脚本能用」，它把口子收窄成三条：① 只发往 loopback 与私网地址（`127.0.0.1` / `localhost` / `10/8` / `172.16-31` / `192.168/16` / `169.254/16`，域名一律拒绝）；② 只认白名单里的操作（aria2 那几个 JSON-RPC 方法、MediaGo 的 `/api/downloads` 系列路径，且归一化后再确认一次没跑出这个前缀）；③ 单条请求体上限 256 KB。最坏情况是「这个站点的 JS 也能往你自己的 aria2 / MediaGo 里塞任务、看任务列表」——它本来就在同一台机器上和你一起用这两个服务——但拿不到更多东西，也去不了公网和别的内网主机。
 
 ### ⬇ 下载触发的细节
 
-- **只发 workflow 声明过的 input**：`m3u8.yml` / `aria2.yml` 的 `inputs:` 里没写的 key 一律不发——多写一个 key GitHub 会整个 422（`Unexpected input`）。脚本发 `urls` + `save_name` + `headers`（后者的值见下条），**选了 M3U8 才多带 `mux_format`**（`aria2.yml` 没有这个 key，MP4 那条带上就是 422），勾了「传到 HF」才多带 `hf_upload` / `hf_repo` / `hf_path`（这三条两个 yml 都声明过，投给哪条都收得下），其余参数留在 workflow 的默认值上。
-- **请求头：UA 与来源是铺进那一栏给你看的，不是后台默默补**（`v2.17` 改的就是这一点）。开单子时脚本先把两条写进 `headers` 输入框——`User-Agent` 取当前页面 `navigator.userAgent` 那一串，`Referer` 取本站 origin（`https://j7tu.com/`；详情页的 `#/videoDetail` 路由对服务器没有意义，所以不带上）——再把 ⚙ 里那条额外的并进去（同名以 ⚙ 为准），⚙ 里那栏底下会同一时刻印出「单子里那一栏会铺成：{…}」，两处逐字相同。随后**栏里是什么就发什么**：改一条发一条，删掉 `User-Agent` 那条就真的不带它，整栏清空就是这次不带任何自定义头（面板会另起一行点破：媒体域对没有 UA/来源的直连常会拒绝）。只有栏里写成了「不是 JSON 对象」的东西才退回自动那两条，而面板会改口写明这次是退回而不是照栏子发。头名大小写不敏感（`ua` / `referer` 也归一化成 `User-Agent` / `Referer`），显式写成空串等于「这条不要」。⚙ 之所以只存额外那几条、不把这两条一起存：这个脚本是 `@grant none`，设置落在 j7tu.com 的 localStorage 里，UA 一旦落盘，浏览器升级后发出去的就是过期那串。最终那一串 JSON 原样进 `inputs.headers`，两个 `download.py` 的 `parse_headers` 都吃 JSON 对象。
-- **文件名的后缀规则两边相反**（这是最容易想当然的一处，脚本按两个 `download.py` 的实现各自处理）：`aria2.yml` 是 `aria2c -o <save_name>` 原样落盘，不给扩展名就得到一个没扩展名的文件 → **MP4 那条自动补 `.mp4`**（单子上自己写了 `.mkv` 就尊重你写的）；`m3u8.yml` 的 `--save-name` 反过来**不能带后缀**，N_m3u8DL-RE 按 `mux_format` 自己补，传 `x.mp4` 会落成 `x.mp4.mp4` → M3U8 那条在发出去前把后缀剥掉。单子上改选另一条格式时，输入框里的名字会当场按新规则重排（你手打过的部分保留，只动后缀）。默认名取详情标题（去掉非法文件名字符），预告那条再加「 预告」。
-- **「转成 MP4」「传到 HF」和那一栏上传目录会被记住**：分别存进 `one_gh_mux`、`one_gh_hf`、`one_gh_hf_path`（`1`/`0` + 目录原文），下次开单子、刷新页面都读回来；⚙ 里那组 HF 字段就是这三个键的编辑入口（也是单子的默认值），两边共用同一个键、不会打架。单子上其余两项（选哪条链接、文件名）每次重新铺默认值，故意不记——记着上一次的容易把预告当正片发出去。没点「✓ 确认触发」而点「取消」时，一个字都不写回。
+- **只发 workflow 声明过的 input**：`m3u8.yml` / `aria2.yml` 的 `inputs:` 里没写的 key 一律不发——多写一个 key GitHub 会整个 422（`Unexpected input`）。脚本发 `urls` + `save_name` + `headers`（后者的值见下条），**选了 M3U8 才多带 `mux_format`**（`aria2.yml` 没有这个 key，MP4 那条带上就是 422），勾了「传到 HF」才多带 `hf_upload` / `hf_repo` / `hf_path`（这三条两个 yml 都声明过，投给哪条都收得下），其余参数留在 workflow 的默认值上。**没勾 GitHub 那条就一个 GitHub 请求都不发**（本地出口跟 GitHub 完全无关，不需要 Token）。
+- **请求头：UA 与来源是铺进那一栏给你看的，不是后台默默补**（`v2.17` 改的就是这一点，`v2.18` 起本地两个出口也用这同一栏）。开单子时脚本先把两条写进 `headers` 输入框——`User-Agent` 取当前页面 `navigator.userAgent` 那一串，`Referer` 取本站 origin（`https://j7tu.com/`；详情页的 `#/videoDetail` 路由对服务器没有意义，所以不带上）——再把 ⚙ 里那条额外的并进去（同名以 ⚙ 为准），⚙ 里那栏底下会同一时刻印出「单子里那一栏会铺成：{…}」，两处逐字相同。随后**栏里是什么就发什么**：改一条发一条，删掉 `User-Agent` 那条就真的不带它，整栏清空就是这次不带任何自定义头（面板会另起一行点破：媒体域对没有 UA/来源的直连常会拒绝）。只有栏里写成了「不是 JSON 对象」的东西才退回自动那两条，而面板会改口写明这次是退回而不是照栏子发。头名大小写不敏感（`ua` / `referer` 也归一化成 `User-Agent` / `Referer`），显式写成空串等于「这条不要」。⚙ 之所以只存额外那几条、不把这两条一起存：这个脚本是 `@grant none`，设置落在 j7tu.com 的 localStorage 里，UA 一旦落盘，浏览器升级后发出去的就是过期那串。最终那一串 JSON 原样进 `inputs.headers`（GitHub），本地两个出口则各自转成 `Name: Value` 数组（aria2 `header`）与逐行文本（MediaGo `headers`）。
+- **文件名后缀规则三个出口各不相同**（这是最容易想当然的一处，脚本按各家的实现分别处理）：`aria2.yml` 是 `aria2c -o <save_name>` 原样落盘，不给扩展名就得到一个没扩展名的文件 → **MP4 那条自动补 `.mp4`**（单子上自己写了 `.mkv` 就尊重你写的）；`m3u8.yml` 的 `--save-name` 反过来**不能带后缀**，N_m3u8DL-RE 按 `mux_format` 自己补，传 `x.mp4` 会落成 `x.mp4.mp4` → M3U8 那条在发出去前把后缀剥掉；本地 **aria2** 跟 `aria2.yml` 一样是 `-o` 原样落盘（同样自动补后缀），**MediaGo** 的 `name` 反过来不带后缀（后缀按链接类型由它补）。单子上改选另一条格式、或改勾出口时，输入框里的名字会当场按「当前实际要发的那一组出口」的规则重排（你手打过的部分保留，只动后缀）。默认名取详情标题（去掉非法文件名字符），预告那条再加「 预告」。
+- **「转成 MP4」「传到 HF」、上传目录、本地那几个连接参数都会被记住**：分别存进 `one_gh_mux`、`one_gh_hf`、`one_gh_hf_path`、`one_aria_*`、`one_mg_*`（`1`/`0` + 原文），下次开单子、刷新页面都读回来；⚙ 里那几组字段就是这些键的编辑入口（也是单子的默认值），两边共用同一个键、不会打架。单子上其余两项（选哪条链接、文件名）每次重新铺默认值，故意不记——记着上一次的容易把预告当正片发出去。没点「✓ 确认发送」而点「取消」时，一个字都不写回。
 - **传到 Hugging Face 的那一步**：勾了单子上的「☁ 传到 HF」才发 `hf_upload=true`，产物由 workflow 用 `HfApi` 按 **dataset 仓库**上传（`upload_folder`），落到 `hf_path` 指的那个仓库内子目录（留空=根）。**HF 的 token 不经过脚本**：只从目标仓库的 Secret 读 `ARIA2_HF_TOKEN` / `M3U8_HF_TOKEN`；`hf_repo` 留空时退到 Secret `ARIA2_HF_REPO` / `M3U8_HF_REPO`，两边都没有就是「记下失败并跳过上传」（下载本身不受影响）。仓库不存在时服务端按 `private` 建（由 Secret `<tool>_HF_PRIVATE` 决定，默认 `true`），已存在的仓库不会被脚本改可见性。
 - **`urls` 只放一条裸链接**：两个 workflow 的 `parse_urls` 都按换行分割、逗号也算分隔符，所以清单里不能出现空格/逗号/多条（M3U8 那条 `params` 里本身没有逗号，MP4 直链也没有）。
 - **204 不返回运行 id**：dispatch 成功只给 204，脚本改从 `…/runs?per_page=5&event=workflow_dispatch` 里按 `created_at >= 触发时刻-30s` 认那一次，认不到就明说（避免把一小时前的旧运行当成刚触发的）。轮询期间再点 ⬇ 会作废上一次轮询。
-- **`@grant none` 的代价**：没有 `GM_xmlhttpRequest`，这一发 POST 是**用页面自己的 fetch 从 `j7tu.com` 这个源跨域打到 `api.github.com`**（OPTIONS 预检 + 响应都要过，GitHub 回 `Access-Control-Allow-Origin: *`，实测通）。Token 也因此存在 j7tu.com 的 localStorage 里，**请只用「只授权这一个仓库 + Actions: write」的 fine-grained token**，别拿账号级 PAT。
+- **`@grant none` 的代价**：主脚本没有 `GM_xmlhttpRequest`，GitHub 那一发 POST 是**用页面自己的 fetch 从 `j7tu.com` 这个源跨域打到 `api.github.com`**（OPTIONS 预检 + 响应都要过，GitHub 回 `Access-Control-Allow-Origin: *`，实测通）。Token 也因此存在 j7tu.com 的 localStorage 里，**请只用「只授权这一个仓库 + Actions: write」的 fine-grained token**，别拿账号级 PAT。本地 aria2 / MediaGo 打不通也是同一个原因（CORS + 私有网络策略），所以才需要那个带 `@grant` 的伴生脚本。
 - **M3U8 那条会过期**：`params` 是这次详情临时生成的，runner 排队+启动要几十秒到几分钟；面板会打印这条详情距今多少秒，过期就重新取一次详情再点 ⬇。
 - **失败都有名字**：401（token 无效/过期/没 Actions 权限）、403（私有仓库没覆盖到 / 防滥用限制）、404（token 看不到这个仓库，或 owner/repo、workflow 文件名写错）、422（该分支上的 yml 没声明这次发的 inputs），`action_required` 会提示去 Actions 页面点 Run job（私有仓库额度用完会卡在这）。
 - **仓库写法**：⚙ 的「仓库」框粘 `https://github.com/owner/repo.git`、`git@github.com:owner/repo.git` 或 `owner/repo` 都认，会被归一化成 `owner/repo` 再存；写坏了自动退回默认 `owner/gh-toolbox`。
@@ -700,7 +728,7 @@ CF_MODE=none RUN_MINUTES=0 python tools/qinglong/run_panel.py
 
 ### 注意事项
 
-- 只匹配 `j7tu.com`（`@noframes`），只做「拦请求 + 重取详情 + 打印链接」，**不调用购买/扣币接口，脚本自己一个字节都不下**；⬇ 只是把链接投给你自己的 workflow——下哪条、叫什么名字、要不要转封装、传不传 HF 数据集、传进哪个目录、带哪些请求头（`headers` 那一栏里写的就是发出去的那份，UA 与来源也是铺在栏里的），都是你在单子上自己填完再点「✓ 确认触发」的，点「取消」不发任何东西、也不改任何被记住的默认值。
+- 只匹配 `j7tu.com`（`@noframes`），只做「拦请求 + 重取详情 + 打印链接」，**不调用购买/扣币接口，脚本自己一个字节都不下**；⬇ 只是把链接投给你自己的下载通道——下哪条、发到哪（GitHub / 本地 aria2 / MediaGo，可多选）、叫什么名字、要不要转封装、传不传 HF 数据集、传进哪个目录、带哪些请求头（`headers` 那一栏里写的就是发出去的那份，UA 与来源也是铺在栏里的），都是你在单子上自己填完再点「✓ 确认发送」的，点「取消」不发任何东西、也不改任何被记住的默认值。
 - 内置的 one 模块 token 带 `exp`，到期后在 ⚙ 的「模块 token」框里粘新的（会覆盖内置值并被记住）。
 - 改过脚本要**刷新页面**再测：同一文档里留两层钩子时，状态条会显示 `⚠页面里有 N 层钩子`。
 - 面板里所有链接都是 `target=_blank` + `rel=noopener noreferrer`，且整行文字可选中复制；服务端字段里的尖括号只当文字处理，不拼 innerHTML。
