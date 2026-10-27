@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ONE 本地下载转发（aria2 / MediaGo）
 // @namespace    qoder.one.local.dispatch
-// @version      1.0.0
+// @version      1.1.0
 // @description  one-detail-fetcher.user.js 的伴生脚本：主脚本是 @grant none（拦 App 请求靠的就是它），够不到 127.0.0.1 上的 aria2 / MediaGo；这个脚本带 GM_xmlhttpRequest，专门替它把 JSON-RPC / HTTP 发出去，再把结果写回 <html> 上的属性。没有界面、没有存储。
 // @match        https://j7tu.com/*
 // @match        http://j7tu.com/*
@@ -55,20 +55,19 @@
  * 页面主世界的脚本没法对页面保密：属性就写在页面的 DOM 上，j7tu.com 自己的
  * JS 也看得见、也能往里塞请求。所以本脚本做不到「只有主脚本能用」，它只能
  * 把口子收窄：
- *   1) 只发往 loopback（127.0.0.1 / localhost / [::1] / 0.0.0.0）与私网地址
- *      （10/8、172.16/12、192.168/16、169.254/16）—— 不能拿它当访问公网
- *      或任意内网主机的代理。域名一律拒绝（内网主机名认不准，认不准就不放）；
+ *   1) 地址白名单已移除：允许发往任意 http/https 地址（本机、局域网、域名均可）。
+ *      代价是页面 JS 理论上也能借它向任意地址发请求 —— 使用者自行权衡；
  *   2) 只认白名单里的操作：aria2 那几个 JSON-RPC 方法 + MediaGo 的
  *      /api/downloads 系列路径；
  *   3) 单条请求体上限 256 KB。
- * 最坏情况因此是「这个站点的 JS 也能往你自己的 aria2 / MediaGo 里塞任务、
- * 看任务列表」—— 它本来就在同一台机器上和你一起用这两个服务 —— 但拿不到
- * 更多的东西。
+ * 最坏情况因此是「这个站点的 JS 也能往你的 aria2 / MediaGo（或白名单地址
+ * 覆盖到的其他服务）里塞任务、看任务列表」—— 它本来就在同一台机器上和你
+ * 一起用这些服务 —— 但拿不到更多的东西。
  */
 (function () {
   "use strict";
 
-  var VERSION = "1.0.0";
+  var VERSION = "1.1.0";
   var REQ_ATTR = "data-oneqz-local";
   var RES_ATTR = "data-oneqz-local-res";
   var READY_ATTR = "data-oneqz-local-ready";
@@ -114,28 +113,13 @@
     return chain;
   }
 
-  /* ---------- 只放行本机 / 私网 ---------- */
-  function privateHost(host) {
-    var h = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
-    if (!h) return false;
-    if (h === "localhost" || h === "::1" || h === "0.0.0.0") return true;
-    if (/\.localhost$/.test(h)) return true;
-    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-    if (!m) return false;                       // 域名一律拒绝：解析到哪台机器我们看不见
-    var a = +m[1], b = +m[2];
-    if (m[1] === "127" || a === 10) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 169 && b === 254) return true;    // link-local
-    return false;
-  }
+  /* ---------- 地址校验 ---------- */
+  /* 白名单拦截已移除：不再限制只能发往本机 / 局域网，域名（如 n1）也能直接发。
+     仍保留协议检查与 URL 归一化。 */
   function localUrl(raw) {
     var u;
     try { u = new URL(String(raw || "")); } catch (e) { throw new Error("地址不合法：" + String(raw || "").slice(0, 80)); }
     if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("只支持 http/https：" + u.protocol);
-    if (!privateHost(u.hostname)) {
-      throw new Error("只允许本机或局域网地址（127.0.0.1 / localhost / 10.x / 172.16-31.x / 192.168.x），拒绝 " + u.hostname);
-    }
     return u;
   }
 
@@ -259,7 +243,7 @@
     reply(msg.id, false, null, "不认识的 op：" + op);
   }
 
-  /* 一条请求必有且只有一条回应：校验是同步 throw（方法不在白名单、地址不是本机、
+  /* 一条请求必有且只有一条回应：校验是同步 throw（方法不在白名单、协议不对、
      路径越界），所以必须放进 Promise.resolve().then 里接住 —— 否则那条请求永远收不到回应，
      对面只能等到 25 秒超时，还看不出到底哪一步错了。 */
   function callAndReply(fn, payload, id) {
