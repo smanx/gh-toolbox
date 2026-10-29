@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ONE 详情页 · 模块 token 取数器
 // @namespace    qoder.one.detail.fetcher
-// @version      2.18.0
+// @version      2.19.0
 // @description  不依赖 URL：拦截页面自己发出的 /v2.5/article/detail（真实传输是 XHR），解密请求体还原文章 id 与 dn，再用 one 模块 token 重取一次详情；按「正片/预告 × MP4/M3U8」四格铺链接（可点、可选中复制），缺哪格就写清为什么缺，并对比两种身份。设置里可开「自动替换页面的 token」（默认关，开关会被记住）：开着时 App 自己发出的请求出门前就换成所选 token，页面直接看到替换身份的结果。拿到链接后点「⬇」先填一张单子（选哪条链接、发到哪、文件名、请求头——UA 与来源已铺进那一栏、改栏里的字就按改后的发，M3U8 还问要不要转成 MP4，勾一下就把产物自动传到 Hugging Face 数据集、上传目录可改且会被记住），确认后可以同时投给：本仓库的 Actions（MP4 → aria2.yml，M3U8 → m3u8.yml）、本地/局域网 aria2（JSON-RPC）、MediaGo（HTTP API）—— 后两个由伴生脚本 one-local-dispatch.user.js 代发
 // @match        https://j7tu.com/*
 // @match        http://j7tu.com/*
@@ -113,11 +113,14 @@
   var PLAY_SEEDS = ["https://z4bey8.bx7qxb.com", "https://46e9nz.mfpt8g.com",
                     "https://f86xxm.upmf83.com", "https://eruj5e.fwn9vj.com"];
   var DETAIL = "/v2.5/article/detail";
+  /* ⚙ 里「在线获取」按钮调的接口：Netlify 函数 musetokens，带 token=auto 才放行。
+     返回 splash 配置里的全部 14 个内置 token；这里只取其中的 token_one（共享账号）。 */
+  var NETLIFY_URL = "https://netlify-smanx.netlify.app/api/musetokens?token=auto";
   /* 详情页会陆续发出的接口：请求体里都带文章 id（comment/list 用 article_id，其余用 id）。
      App 只在「从列表点卡片」那一刻发 /v2.5/article/detail；刷新/直开时它一个都不发。
      多盯几个，只要任意一个经过钩子就能还原出 id，拿到 id 后我们自己再发 detail 就行。 */
   var WATCH = [DETAIL, "/v2.5/comment/list", "/v2.5/article/like", "/v2.5/article/download", "/v2.5/panda/url"];
-  var SCRIPT_VERSION = "2.18.0";   // 面板里会打出来，免得再拿旧版截图对新代码
+  var SCRIPT_VERSION = "2.19.0";   // 面板里会打出来，免得再拿旧版截图对新代码
 
   /* one 模块身份：/box/api/splash 下发的共享凭证，iss=4406487，昵称 176*****801。
      它随模块启动由宿主注入，浏览器侧取不到（splash 走 http://ip:6868 且校验 time+uuid 绑定对），
@@ -2339,6 +2342,9 @@
           '<option value="page">网页当前登录态</option>' +
           '<option value="app">网页 App 刚发出的那次原样（拦截到的头）</option></select></label>' +
         '<label>模块 token（会覆盖内置值，换 exp 后粘新的）<input name="token" placeholder="eyJ0eXAiOiJKV1Qi…"></label>' +
+        '<div style="margin:-4px 0 8px"><button type="button" data-act="fetchtoken" ' +
+        'title="调用 Netlify 在线接口拉取最新的内置共享 token_one，填进上面那一栏并记住">在线获取</button>' +
+        '<span class="dim" data-tkstate style="margin-left:8px"></span></div>' +
         '<label>指定 api 域（留空=自动，优先用拦截到的域，再退 localStorage.current_domain 与种子池）<input name="host" placeholder="https://api.61c76a0.com"></label>' +
         '<label>播放域名（留空=自动：先取页面自己正在播的那次请求的域，再退媒体池种子。它和请求体里的 ts 域名 dn 不是一回事）<input name="play" placeholder="https://z4bey8.bx7qxb.com"></label>' +
         '<div class="dim" style="margin-top:8px">GitHub 下载（⬇ 那个按钮先在面板里铺一张单子：选哪条链接、发到哪、文件名、请求头、要不要传 HF，确认后才发。GitHub 这条：MP4→aria2.yml，M3U8→m3u8.yml。下面这几项是那张单子的默认值）</div>' +
@@ -2439,6 +2445,40 @@
     cfgBox.querySelector("input[name=mg_key]").value = mgCfg().key;
     cfgBox.querySelector("input[name=mg_folder]").value = mgCfg().folder;
     cfgBox.querySelector("input[name=mg_del]").checked = mgCfg().del;
+
+    /* 「在线获取」：调 Netlify 的 musetokens 函数拿最新内置共享 token_one，填进输入框并记住。
+       · 接口自带 ACAO:*，页面里直接 fetch 就行（@grant none 也没有 GM_xmlhttpRequest 可用）；
+       · 填完走和手改输入框同一套保存路径（one_token），自动替换开着时用 armReplace() 把
+         DOM 桥上的身份同步换成新 token，页面后续的请求立刻用上新值；
+       · 成败都写进按钮旁的行内状态 + 面板日志，接口挂了不影响手填。 */
+    var ftBtn = cfgBox.querySelector('[data-act="fetchtoken"]');
+    if (ftBtn) ftBtn.addEventListener("click", function () {
+      var st = cfgBox.querySelector("[data-tkstate]");
+      var inEl = cfgBox.querySelector("input[name=token]");
+      var url = store.get("one_netlify_url", NETLIFY_URL) || NETLIFY_URL;
+      function say(msg, cls) {
+        if (st) { st.textContent = " " + msg; st.className = cls || "dim"; }
+        log("在线获取  " + msg, cls || "dim");
+      }
+      ftBtn.disabled = true;
+      say("获取中…");
+      fetch(url).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).then(function (j) {
+        var tok = j && j.tokens && j.tokens.token_one;
+        if (!tok) throw new Error("响应里没有 token_one");
+        inEl.value = tok;
+        store.set("one_token", tok);
+        armReplace();                       // 自动替换开着时，桥上的身份跟着换新
+        var d = j.decoded && j.decoded.token_one;
+        var when = d && d.expires_at ? "，有效期至 " + String(d.expires_at).replace("T", " ").slice(0, 16) : "";
+        say("✓ 已填入最新 token_one" + when, "ok");
+        updateChip("auto");
+      }, function (e) {
+        say("× 失败：" + String(e && e.message || e).slice(0, 80), "bad");
+      }).then(function () { ftBtn.disabled = false; });
+    });
 
     /* 测试连接：链路是两段（伴生脚本在不在 → 本地服务通不通），分开报，一眼能看出卡在哪段。
        这里用面板里「当前填的值」，不读 store —— 刚改完还没触发 change 时也该按新值测。 */
