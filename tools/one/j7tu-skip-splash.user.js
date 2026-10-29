@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         j7tu 跳过开屏广告并屏蔽弹窗广告
 // @namespace    https://j7tu.com/
-// @version      2.0.0
-// @description  跳过 j7tu.com 启动页开屏广告；并从数据源头清空弹窗广告（首页图片/文字弹窗及各频道 popup 弹窗），弹不掉的兜底自动点击关闭按钮
+// @version      2.1.0
+// @description  跳过 j7tu.com 开屏页（清空开屏广告配置，开屏页直接消失）；并从数据源头清空弹窗广告（首页图片/文字弹窗及各频道 popup 弹窗），弹不掉的兜底自动点击关闭按钮
 // @match        https://j7tu.com/*
 // @match        https://www.j7tu.com/*
 // @run-at       document-start
@@ -13,11 +13,16 @@
 /*
  * 原理：
  *
- * 一、跳过开屏广告（1.x 的既有功能）
- *   本站是 Flutter Web 应用，启动页（#/splash）上是一张全屏广告图，
- *   右上角有一个「5S / 4S …」倒计时按钮，点它就会立刻跳到首页（#/app）。
- *   这个按钮画在 canvas 上，没有 DOM 节点，所以脚本按固定坐标
- *   （视口右上角）向 Flutter 的 flt-glass-pane 派发指针事件。
+ * 一、跳过开屏页（2.1 改进 + 1.x 的坐标点击兜底）
+ *   本站是 Flutter Web 应用，开屏页（#/splash）读的是 localStorage 里的
+ *   开屏广告配置（flutter.ad_helper_splash_ad，pattern=full，is_multiple=2）。
+ *   实测发现：即使没有广告数据，开屏页也会傻等 5 秒倒计时才进入首页——
+ *   而且没有广告图时右上角根本没有「跳过」按钮，坐标点击无从下手。
+ *   所以脚本在 document-start 直接把开屏广告键也清空：没有广告数据，
+ *   开屏页整个不再出现，启动后 ~2 秒直接进首页（实测路由时间线：
+ *   0ms 空 hash → 2.2s 已在 #/app）。原坐标点击逻辑保留作兜底：
+ *   若开屏页仍然出现（画着全屏广告图 + 右上角倒计时按钮），脚本按固定
+ *   坐标（视口右上角）向 Flutter 的 flt-glass-pane 派发指针事件点它。
  *
  * 二、屏蔽进入首页后的弹窗广告（2.0 新增）
  *   实测该站的广告配置整体缓存在 localStorage（GetStorage，键名以 flutter.ad_helper_ 开头）：
@@ -29,8 +34,8 @@
  *     1) 启动时请求 /v2.5/ad/space 拿新配置，成功则用新数据弹窗；
  *     2) 该请求失败则回退读取上面的 localStorage 缓存来弹窗。
  *   因此脚本在 document-start（先于 Flutter 启动）做三件事：
- *     A. 把所有 pattern=popup_image / popup_text 的广告键的 ads 数组清空
- *        （只动广告键，不碰启动页、横幅等其它配置），并记住原弹窗图片的 URL；
+ *     A. 把所有 pattern=popup_image / popup_text（弹窗）与 full（开屏）的广告键的 ads 数组清空
+ *        （只动广告键，不碰横幅等其它配置），并记住原弹窗图片的 URL；
  *     B. 拦截 /v2.5/ad/space 请求并模拟网络失败，让新广告数据进不来，
  *        应用只能走回退路径——而缓存已被清空，于是无弹窗可弹；
  *     C. 兜底：若 A/B 失效弹窗仍然出现，它的图片请求（URL 在步骤 A 已记录）
@@ -63,7 +68,7 @@
   // --------------------------------------------------------------------------
 
   // ======================================================================
-  // 一、弹窗广告屏蔽（必须最先执行：抢在 Flutter 读取 localStorage 之前）
+  // 一、广告配置清理（必须最先执行：抢在 Flutter 读取 localStorage 之前）
   // ======================================================================
 
   // 记录弹窗广告的图片路径，用于兜底识别
@@ -79,7 +84,7 @@
     } catch (e) { /* 忽略解析失败 */ }
   }
 
-  // 把 pattern=popup_image / popup_text 的广告键的 ads 清空
+  // 把 pattern=popup_image / popup_text（弹窗）与 full（开屏）的广告键的 ads 清空
   function emptyPopupAdKeys() {
     try {
       var keys = [];
@@ -98,9 +103,10 @@
             try { obj = JSON.parse(obj); } catch (e) { return; }
           }
           if (!obj || typeof obj !== 'object') return;
-          if (obj.pattern !== 'popup_image' && obj.pattern !== 'popup_text') return;
+          if (obj.pattern !== 'popup_image' && obj.pattern !== 'popup_text' && obj.pattern !== 'full') return;
 
-          collectPopupImageUrls(obj);
+          // 开屏广告（pattern=full）不参与弹窗兜底，只清空
+          if (obj.pattern === 'popup_image') collectPopupImageUrls(obj);
 
           obj.ads = [];
           if (obj.parameters) obj.parameters.is_multiple = '0';
@@ -206,55 +212,50 @@
 
   setInterval(pumpPopupCloseTaps, 250);
 
-  // ---- 拦截网络请求：广告配置接口 + 弹窗图片 ----
+  // ---- 拦截网络请求：改写目标地址，让请求以真实网络错误快速失败 ----
+  // 不可达地址：连接立即被拒，浏览器会派发真实的 error 事件，
+  // 应用的 HTTP 库（Dart http/dio）能正常收到失败并走「读缓存」回退。
+  // （不要用手工派发合成事件来模拟失败：Dart 侧在等原生 load/error 事件，
+  //   合成事件时机/类型稍有出入就会让请求 Promise 永远挂起，实测会卡死启动屏。）
+  var BLOCKED_BASE = 'https://127.0.0.1:9';
+
+  function rewriteToBlocked(url) {
+    try {
+      return BLOCKED_BASE + String(url).replace(/^[a-z][a-z0-9+.-]*:\/\/[^\/]*/i, '');
+    } catch (e) {
+      return BLOCKED_BASE;
+    }
+  }
+
   var origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
-    try {
-      this.__j7tuUrl = String(url || '');
-      this.__j7tuBlock = blockTypeOf(this.__j7tuUrl);
-    } catch (e) { this.__j7tuBlock = 0; }
-    return origOpen.apply(this, arguments);
-  };
-
-  var origSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function () {
-    if (this.__j7tuBlock) {
-      var xhr = this;
-      var type = this.__j7tuBlock;
-      // 不真正发出请求，异步模拟一次网络错误（等价于请求被防火墙掐断），
-      // 应用会走「请求失败 → 读缓存」的回退逻辑，而缓存已被清空。
-      setTimeout(function () {
-        try {
-          xhr.readyState = 4;
-          xhr.status = 0;
-          xhr.dispatchEvent(new ProgressEvent('error'));
-          xhr.dispatchEvent(new ProgressEvent('loadend'));
-        } catch (e) {
-          try { xhr.abort(); } catch (e2) { /* 忽略 */ }
-        }
-      }, 0);
+    var type = 0;
+    try { type = blockTypeOf(url); } catch (e) { type = 0; }
+    if (type) {
       if (type === 2) schedulePopupCloseTap();
-      return;
+      url = rewriteToBlocked(url);
+      // 注意：必须显式传入改写后的 url，不能用 arguments（那还是原始地址）
+      return origOpen.call(this, method, url);
     }
-    return origSend.apply(this, arguments);
+    return origOpen.apply(this, arguments);
   };
 
   if (typeof window.fetch === 'function') {
     var origFetch = window.fetch;
-    window.fetch = function (input) {
+    window.fetch = function (input, init) {
       var url = typeof input === 'string' ? input : (input && input.url) || '';
       var type = 0;
       try { type = blockTypeOf(url); } catch (e) { type = 0; }
       if (type) {
         if (type === 2) schedulePopupCloseTap();
-        return Promise.reject(new TypeError('Failed to fetch'));
+        return origFetch.call(this, rewriteToBlocked(url), input instanceof Request ? undefined : init);
       }
       return origFetch.apply(this, arguments);
     };
   }
 
   // ======================================================================
-  // 二、跳过开屏广告（1.x 既有逻辑，保持不变）
+  // 二、跳过开屏页兜底（1.x 坐标点击逻辑；正常情况下开屏页已不再出现）
   // ======================================================================
 
   var startedAt = Date.now();
