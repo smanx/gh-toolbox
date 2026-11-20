@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ONE 详情页 · 模块 token 取数器
 // @namespace    qoder.one.detail.fetcher
-// @version      2.19.1
+// @version      2.19.3
 // @description  不依赖 URL：拦截页面自己发出的 /v2.5/article/detail（真实传输是 XHR），解密请求体还原文章 id 与 dn，再用 one 模块 token 重取一次详情；按「正片/预告 × MP4/M3U8」四格铺链接（可点、可选中复制），缺哪格就写清为什么缺，并对比两种身份。设置里可开「自动替换页面的 token」（默认关，开关会被记住）：开着时 App 自己发出的请求出门前就换成所选 token，页面直接看到替换身份的结果。拿到链接后点「⬇」先填一张单子（选哪条链接、发到哪、文件名、请求头——UA 与来源已铺进那一栏、改栏里的字就按改后的发，M3U8 还问要不要转成 MP4，勾一下就把产物自动传到 Hugging Face 数据集、上传目录可改且会被记住），确认后可以同时投给：本仓库的 Actions（MP4 → aria2.yml，M3U8 → m3u8.yml）、本地/局域网 aria2（JSON-RPC）、MediaGo（HTTP API）—— 后两个由伴生脚本 one-local-dispatch.user.js 代发
 // @match        https://j7tu.com/*
 // @match        http://j7tu.com/*
@@ -102,6 +102,19 @@
  *   MP4 在媒体池每个成员上都是同一个文件，以前只把主链接铺进 ⬇ 的单子，镜像只写在面板日志里；
  *   现在主链接后面紧跟其余镜像（标「镜像」、host 不同），选哪条就发哪条 —— 主域抽风时不用
  *   先去 ⚙ 改播放域名再重取。M3U8 挂在 api 域、params 还是这次详情现生成的，没有镜像可换。
+ *
+ * 影视详情也管用（v2.19.2 / v2.19.3）：
+ *   实测「发现 → 影视 → 点卡片」进影视详情，App 确实会发 /v2.5/article/detail —— 而且一次发
+ *   三条：第一条是刚点开的，后两条是预取的邻片。之前「个别能识别」的根因有两个：
+ *     ① v2.19.2 的兜底拿「上一页第一张大图」，只有点第一行时才碰巧对；
+ *     ② 认「先发出的那条 detail」也不对，预取邻片会把它覆盖掉。
+ *   v2.19.3 的判据换成 App 自己的记录：localStorage["flutter.recordKey"] 是它写的最近浏览
+ *   （B6() @main.dart.js:181857，按 article_id 去重后插到最前），首条就是刚点开的那条。
+ *   所以流程是：detail 拦到 id → 记下这批出现过的所有 detail id → 900ms 后用 recordKey 首条
+ *   仲裁（只在首条确实出现在这批里时才改），错的那份响应作废让 ⬇ 重取。
+ *   兜底顺序：detail 请求体 > recordKey 首条 > 页面大图路径（最后手段，详情页常沿用列表的图）。
+ *   影视详情没有请求体可带 dn，此时现取一次 bootstrap，用 domain.flutter_ts_domain[0] 当 dn ——
+ *   服务端只在请求体带 dn 时才回 video_hls。实测 4 条影视条目全部识别正确且都拿到 M3U8。
  */
 (function () {
   "use strict";
@@ -118,6 +131,7 @@
   var PLAY_SEEDS = ["https://z4bey8.bx7qxb.com", "https://46e9nz.mfpt8g.com",
                     "https://f86xxm.upmf83.com", "https://eruj5e.fwn9vj.com"];
   var DETAIL = "/v2.5/article/detail";
+  var BOOTSTRAP = "/v2.5/bootstrap";
   /* ⚙ 里「在线获取」按钮调的接口：Netlify 函数 musetokens，带 token=auto 才放行。
      返回 splash 配置里的全部 14 个内置 token；这里只取其中的 token_one（共享账号）。 */
   var NETLIFY_URL = "https://netlify-smanx.netlify.app/api/musetokens?token=auto";
@@ -125,7 +139,7 @@
      App 只在「从列表点卡片」那一刻发 /v2.5/article/detail；刷新/直开时它一个都不发。
      多盯几个，只要任意一个经过钩子就能还原出 id，拿到 id 后我们自己再发 detail 就行。 */
   var WATCH = [DETAIL, "/v2.5/comment/list", "/v2.5/article/like", "/v2.5/article/download", "/v2.5/panda/url"];
-  var SCRIPT_VERSION = "2.19.1";   // 面板里会打出来，免得再拿旧版截图对新代码
+  var SCRIPT_VERSION = "2.19.3";   // 面板里会打出来，免得再拿旧版截图对新代码
 
   /* one 模块身份：/box/api/splash 下发的共享凭证，iss=4406487，昵称 176*****801。
      它随模块启动由宿主注入，浏览器侧取不到（splash 走 http://ip:6868 且校验 time+uuid 绑定对），
@@ -229,6 +243,7 @@
   var STAT = { seen: 0, plain: 0, ids: 0, repl: 0, last: [] };
   var RAW_FETCH = null;   // 沙箱内直接装钩子时的兜底：本脚本自己的请求走原生 fetch
   var HOOK = { mode: null, world: "unknown", relay: false, error: "" };   // direct=同世界直接拦到 / local=隔离世界靠注入回传 / relay=注入已 ack
+  var capSeq = 0;             // 请求捕获序号：异步解密回调乱序时靠它认「第一条 detail」
   var NONCE = "oneqz" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   var capListeners = [];
   function onCapture(fn) { capListeners.push(fn); }
@@ -266,6 +281,74 @@
     }
     return "";
   }
+  function allMediaIds() {
+    var list;
+    try { list = performance.getEntriesByType("resource") || []; } catch (e) { return []; }
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var n = String((list[i] && list[i].name) || "");
+      var m = /\/storage\/thumb\/(\d+)\//.exec(n);
+      if (!m || /_thumbnail|_thumb_/i.test(n)) continue;
+      if (!/\.(?:jpe?g|png|webp|gif)(?:\?|$)/i.test(n)) continue;
+      out.push({ id: m[1], at: Number(list[i].startTime) || 0 });
+    }
+    out.sort(function (a, b) { return a.at - b.at; });
+    return out;
+  }
+  var mediaWatch = { routeAt: 0, prevIds: [] };
+  function movieIdFromPage() {
+    /* 详情页通常不再取大图，用的就是列表/搜索页那批里「第一条」——用户点的那张。
+       拿最新一条会错：momoyih 搜索结果里最后加载的是 6704，点开的却是第一条 64492。 */
+    var prev = mediaWatch.prevIds || [];
+    if (prev.length) return prev[0].id;
+    var all = allMediaIds();
+    return all.length ? all[0].id : null;
+  }
+  /* 影视详情不点「用模块 token 重取」也拦不到 id：这个页面只用列表传进来的内存对象渲染，
+     一次 detail 请求都不发。这里从页面自己取过的大图路径里把 id 捞出来，让面板照常能取数。
+     实测（2026-11-20）三条来源的可靠度，按这个顺序用：
+       1) 拦截到的 article/detail 请求体 —— 最准，App 进详情必发（点播/影视都发）；
+       2) localStorage["flutter.recordKey"] 第一条 —— App 自己写的「最近浏览」，进详情就写，
+          article_id 就是刚点的那条（B6() @main.dart.js:181857，按 article_id 去重后插到最前）；
+       3) 页面大图路径 —— 最不可靠：详情页常常沿用列表的图，点第 3 行时最后加载的可能是第 4 行，
+          只在前两条都拿不到时兜底，并且不覆盖已经认出来的 id。 */
+  function recordKeyIds() {
+    var raw = null;
+    try { raw = localStorage.getItem("flutter.recordKey"); } catch (e) { return []; }
+    if (!raw) return [];
+    var arr = null;
+    try {
+      arr = JSON.parse(raw);
+      if (typeof arr === "string") arr = JSON.parse(arr);   // GetStorage 是「JSON 里再套一层字符串」
+    } catch (e) { return []; }
+    if (!Array.isArray(arr)) return [];
+    return arr.map(function (x) {
+      var id = x && (x.article_id != null ? x.article_id : x.id);
+      return id != null && /^\d+$/.test(String(id)) ? String(id) : null;
+    }).filter(Boolean);
+  }
+  /* 当前条目的「App 视角」答案：recordKey 第一条 = 刚点开的那条（B6() 按 article_id 去重后插到最前）。 */
+  function recordKeyFirst() { var ids = recordKeyIds(); return ids.length ? ids[0] : null; }
+  function ensureMovieId() {
+    var route = CAP.route || String(location.hash || "");
+    var onDetail = route.indexOf("videoDetail") >= 0 || route.indexOf("minified:") >= 0;
+    if (!onDetail) return null;
+    /* detail 请求给的 id 一律不被兜底覆盖：影视详情会连发多条（当前条 + 预取邻片），
+       该认哪条由 reconcileNow 用浏览记录 + 成员校验来纠，这里只管「一个 id 都没有」的情形。 */
+    if (CAP.id && CAP.idFrom === "detail") return null;
+    var from = "", id = recordKeyFirst();
+    if (id) from = "App 的最近浏览记录（flutter.recordKey）";
+    if (!id) {
+      id = movieIdFromPage();
+      from = "详情页大图路径（最后兜底；这个页面有时沿用列表的图，不可靠）";
+    }
+    if (!id || CAP.id === id) return null;
+    CAP.id = id;
+    CAP.plain = "id=" + id;
+    CAP.idFrom = from;
+    return id;
+  }
+
   function refreshPlayHost() {
     var live = playHostFromPage();
     if (live) { CAP.playHost = live; CAP.playFrom = "页面正在播的那次请求"; }
@@ -318,6 +401,7 @@
   }
   function noteCapture(headers, body, url, hash) {
     if (dup(headers, body, url)) return;
+    var seq = ++capSeq;   // 请求发出的先后顺序（解密是异步的，不能拿回调先后当顺序）
     STAT.seen++;
     var fromDetail = url && url.indexOf(DETAIL) >= 0;
     CAP.headers = headers || null;
@@ -332,6 +416,17 @@
       noteStat(true, id);
       if (!id) { if (fromDetail) CAP.response = null; emit("body-noid"); return; }
       STAT.ids++;
+      /* 影视详情会连发 3 次 detail：第一条是当前点开的那条，后两条是预取的邻片。
+         同一路由只认第一条，否则 CAP.id 会被最后一条邻片覆盖（实测 momoyih 点 64492 却显示 64494）。 */
+      if (fromDetail) {
+        var route = hash || location.hash || "";
+        /* 影视详情会连发 3 次 detail：第一条是当前点开的那条，后两条是预取的邻片。
+           解密回调可能乱序返回，所以按「发出时的序号」认第一条，不按回调先后。 */
+        if (CAP.detailSeq != null && CAP.detailSeq <= seq) { emit("id-same"); return; }
+        CAP.detailSeq = seq;
+        CAP.firstDetailRoute = route;
+        CAP.firstDetailId = id;
+      }
       var changed = CAP.id !== id;
       CAP.id = id;
       CAP.plain = plain;
@@ -339,8 +434,42 @@
       if (dn) CAP.dn = dn;   // 只是 ts 探活域，记录它是为了说明「拼链接为什么不用它」
       CAP.idFrom = fromDetail ? "detail" : (url || "").replace(/^.*\/v2\.5\//, "").split("?")[0];
       if (changed || !fromDetail) CAP.response = null;
+      if (fromDetail) {
+        /* 记下这次详情期间出现过的所有 detail id（当前条 + 预取的邻片），
+           稍后用 App 自己的浏览记录在这几个里认当前条，见 reconcileWithRecordKey。 */
+        CAP.detailIds = CAP.detailIds || [];
+        if (CAP.detailIds.indexOf(String(id)) < 0) CAP.detailIds.push(String(id));
+        scheduleReconcile();
+      }
       emit(changed ? "id" : "id-same");
     }, function () { noteStat(false, ""); if (fromDetail) CAP.response = null; emit("body-bad"); });
+  }
+  /* 影视详情一次会发多条 detail（当前条 + 预取的邻片），拦到的顺序不等于「用户点的是哪条」。
+     App 自己写的 flutter.recordKey 第一条就是刚点开的那条，用它来仲裁：
+     若当前 CAP.id 不在浏览记录里、或浏览记录首条就在这批 detail 里，则以浏览记录首条为准。
+     延迟一拍再判：recordKey 是进详情后才写的，detail 请求往往比它先到。 */
+  var reconcileTimer = null;
+  function scheduleReconcile() {
+    if (reconcileTimer) return;
+    reconcileTimer = setTimeout(function () {
+      reconcileTimer = null;
+      reconcileNow();
+    }, 900);
+  }
+  function reconcileNow() {
+    var ids = CAP.detailIds || [];
+    if (!ids.length) return;
+    var want = recordKeyFirst();
+    /* 只有「浏览记录首条确实出现在这批 detail 里」才纠偏：否则浏览记录可能是上一条/还没写入，
+       拿它去改 detail 认出来的 id 就是凭猜测改数据。 */
+    if (!want || ids.indexOf(String(want)) < 0) return;
+    if (String(CAP.id) === String(want)) return;
+    var others = ids.filter(function (x) { return x !== String(want); });
+    CAP.id = want;
+    CAP.plain = "id=" + want;
+    CAP.idFrom = "App 的最近浏览记录（这批 detail 里还有 " + others.join("/") + "，是预取的邻片）";
+    CAP.response = null;      // 手上那份响应可能是邻片的，作废，让 ⬇ 重新取
+    emit("id");
   }
   function noteResponse(text, url) {
     if (url && url.indexOf(DETAIL) < 0) return;      // 只收 detail 的响应，comment/list 之类不参与门控判读
@@ -691,6 +820,9 @@
   function clearCapture(reason) {
     CAP.id = null; CAP.headers = null; CAP.body = null; CAP.plain = null; CAP.response = null; CAP.at = 0;
     CAP.resId = null;   // 「用模块 token 重取」那份跟着一起作废，否则换卡片后 ⬇ 会拿上一篇的链接去触发下载
+    CAP.firstDetailId = null; CAP.firstDetailRoute = null; CAP.detailSeq = null;
+    CAP.detailIds = null;
+    if (reconcileTimer) { clearTimeout(reconcileTimer); reconcileTimer = null; }
     emit(reason || "route");
   }
 
@@ -811,29 +943,26 @@
     var m = /^(https?:\/\/[^/]+)/.exec(u);
     return m ? m[1] : "";
   }
+  function apiHeaders(ts, ident) {
+    return {
+      "platform": PLATFORM,
+      "uuid": ident.uuid,
+      "timestamp": String(ts),
+      "token": ident.token,
+      "app-version": APP_VERSION,
+      "sign": MD5(MD5("0.0.0.0." + PLATFORM + "." + ts + "." + ident.userKey + "." + ident.uuid) + SALT),
+      "user-key": ident.userKey,
+      "ip": "0.0.0.0",
+      "content-type": "application/x-www-form-urlencoded"
+    };
+  }
   function fetchDetail(articleId, ident, host) {
     var ts = Math.floor(Date.now() / 1000);
     // 签名原文 = "<ip>.<platform>.<ts>.<user-key>.<uuid>"，ip 固定 "0.0.0.0"
-    var base = "0.0.0.0." + PLATFORM + "." + ts + "." + ident.userKey + "." + ident.uuid;
-    var sign = MD5(MD5(base) + SALT);
     return encryptParams("id=" + articleId + (CAP.dn ? "&dn=" + encodeURIComponent(CAP.dn) : "")).then(function (body) {
       // rawCall 会置位 __oneqz_pause：即使钩子装在同一个世界，也不会把「模块 token 那次」
       // 反过来写进 CAP 污染 App 身份
-      return rawCall(host + DETAIL, {
-        method: "POST",
-        body: body,
-        headers: {
-          "platform": PLATFORM,
-          "uuid": ident.uuid,
-          "timestamp": String(ts),
-          "token": ident.token,
-          "app-version": APP_VERSION,
-          "sign": sign,
-          "user-key": ident.userKey,
-          "ip": "0.0.0.0",
-          "content-type": "application/x-www-form-urlencoded"
-        }
-      });
+      return rawCall(host + DETAIL, { method: "POST", body: body, headers: apiHeaders(ts, ident) });
     }).then(function (text) {
       var t = (text || "").trim();
       if (/^\{/.test(t)) return safeJson(t) || (function () { throw new Error("响应不是 JSON"); })();
@@ -855,6 +984,40 @@
         log("  × " + String(e && e.message || e).slice(0, 90));
         return next();
       });
+    }
+    return next();
+  }
+
+  /* 影视详情没有 detail 请求体可带 dn，而服务端只在请求体带 dn 时才回 video_hls。
+     bootstrap 里 domain.flutter_ts_domain 首项就是 App 自己拼请求体用的 dn；
+     这个接口返回明文 JSON 或同一套 AES 密文（看入口/浏览器），两种都解。 */
+  function ensureDn(log) {
+    if (CAP.dn) return Promise.resolve(CAP.dn);
+    var hosts = apiHosts(), i = 0;
+    var ident = identity("module");
+    function next() {
+      if (i >= hosts.length || !ident) return Promise.resolve("");
+      var host = hosts[i++];
+      var ts = Math.floor(Date.now() / 1000);
+      return encryptParams("").then(function (body) {
+        return rawCall(host + BOOTSTRAP, { method: "POST", body: body, headers: apiHeaders(ts, ident) });
+      }).then(function (text) {
+        var t = (text || "").trim();
+        var parsed = /^\{/.test(t) ? safeJson(t) : null;
+        if (parsed) return parsed;
+        /* 从浏览器跨域过去时服务端回的是同一套 AES 密文（Node 直接打有时回明文），两种都认 */
+        return tryDecrypt(t).then(function (plain) { return safeJson(plain); }, function () { return null; });
+      }).then(function (j) {
+        var domains = j && j.data && j.data.domain && j.data.domain.flutter_ts_domain;
+        var dn = domains && domains[0];
+        if (/^https?:\/\/[^/]+/.test(String(dn || ""))) {
+          CAP.dn = trimSlash(dn);
+          CAP.dnFrom = "bootstrap（影视详情没有请求体可带 dn）";
+          log("ts 域名(dn) " + CAP.dn + "   ← 从 bootstrap 取的，这次详情没有请求体可带", "dim");
+          return CAP.dn;
+        }
+        return next();
+      }, function () { return next(); });
     }
     return next();
   }
@@ -1868,6 +2031,7 @@
   function showAppCapture() {
     reset();
     openBody();
+    var fallback = ensureMovieId();
     if (!CAP.id) {
       log("还没有拦截到带文章 id 的请求。" + (STAT.seen ? "（钩子已收到 " + STAT.seen + " 个 App 请求，见下）" : "（钩子一次都没收到）"),
           STAT.seen ? "dim" : "bad");
@@ -1880,14 +2044,16 @@
         log("  · 这个 SPA 的详情页只认「从列表点卡片进来」时内存里传的 id；", "dim");
         log("  · 直接刷新或打开 #/videoDetail（哪怕 URL 里带 ?id=）App 会忽略、不发 /v2.5/article/detail，就没有可拦的请求。", "dim");
         log("正确触发：回发现页/收藏列表，点一张视频卡片进来 —— App 自己发的那次 detail 请求会被自动拦下并显示。", "ok");
+        log("  影视详情（发现 → 影视 → 点卡片）也一样：App 会发 detail，脚本按「App 最近浏览记录」认当前那一条。", "dim");
       } else {
         log("× 拦不到 App 是因为脚本被放进了隔离世界，patch 的 fetch/XHR 只对沙箱生效 —— 点「诊断」看修法。", "bad");
       }
       return;
     }
+    if (fallback) log("影视详情   id 取自" + CAP.idFrom + "：" + fallback + " —— 点「用模块 token 重取」即可", "ok");
     log("拦截来源   " + (CAP.route || "?") + "   POST /v2.5/" + (CAP.idFrom || "article/detail"));
     log("请求体明文 " + String(CAP.plain || ("id=" + CAP.id)).slice(0, 160) +
-        "   ← id=" + CAP.id + "（URL 里没有它，只有请求体能给）", "ok");
+        "   ← id=" + CAP.id + "（URL 里没有它，只有请求体/浏览记录能给）", "ok");
     log("ts 域名(dn) " + (CAP.dn || "请求体里没有 dn") +
         "   ← 它就是 M3U8 清单里 *.ts 分片的域名（服务端把 dn 原样写进清单）；mp4 不用它，所以这里不做成链接", "dim", true);
     refreshPlayHost();
@@ -1925,14 +2091,20 @@
   }
 
   function run() {
+    ensureMovieId();
     if (!CAP.id) { showAppCapture(); return; }
     reset();
     openBody();
     var mode = cfgBox ? cfgBox.querySelector("select[name=mode]").value : "module";
     var ident = identity(mode);
     if (!ident) { log("模式「网页 App 那次原样」还没拦截到请求，先用默认身份。", "bad"); ident = identity("module"); }
-    log("文章 id    " + CAP.id + "（来自拦截到的 " + (CAP.idFrom || "?") + " 请求体，不是 URL）", "ok");
+    log("文章 id    " + CAP.id + "（" + (CAP.idFrom === "detail"
+        ? "来自拦截到的 detail 请求体，不是 URL"
+        : (CAP.idFrom || "?")) + "）", "ok");
     log("身份       " + ident.label + "   user-key=\"" + ident.userKey + "\"  uuid=" + ident.uuid);
+    return ensureDn(log).then(afterDn);
+
+    function afterDn() {
     log("接口       POST " + DETAIL + "   body=AES(id=" + CAP.id + (CAP.dn ? "&dn=" + CAP.dn : "") + ")" +
         (CAP.dn ? "" : "   ← 没带 dn，服务端不会给 video_hls，只有 MP4"), "dim");
     log("---- 请求中 ----", "dim");
@@ -1969,9 +2141,10 @@
       pre.className = "json";
       pre.textContent = "完整 JSON（同一份已 console.log）\n" + JSON.stringify(json, null, 1);
       panel.appendChild(pre);
-    }).catch(function (e) {
-      log("× " + String(e && e.message || e), "bad");
-    });
+      }).catch(function (e) {
+        log("× " + String(e && e.message || e), "bad");
+      });
+    }
   }
 
   /* ⬇ 下载用哪份详情：优先「用模块 token 重取」那一次，但它必须还属于当前这个 id
@@ -2778,6 +2951,9 @@
   function onRoute() {
     var now = location.hash || "";
     if (now === lastRoute) return;         // pushState 经常带着同一个 hash 反复调，别每次都当换页
+    /* 记下「刚离开的这一页」期间加载的大图，详情页据此认当前条目（列表第一条就是点的那条） */
+    mediaWatch.prevIds = allMediaIds().filter(function (x) { return x.at >= mediaWatch.routeAt; });
+    mediaWatch.routeAt = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
     lastRoute = now;
     updateChip("route");                   // 状态行先跟上真实路由
     if (CAP.route === now) return;         // 还停在拦到那次请求的页面上，结果仍然是本页的，不清
