@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ONE 详情页 · 模块 token 取数器
 // @namespace    qoder.one.detail.fetcher
-// @version      2.19.0
+// @version      2.19.1
 // @description  不依赖 URL：拦截页面自己发出的 /v2.5/article/detail（真实传输是 XHR），解密请求体还原文章 id 与 dn，再用 one 模块 token 重取一次详情；按「正片/预告 × MP4/M3U8」四格铺链接（可点、可选中复制），缺哪格就写清为什么缺，并对比两种身份。设置里可开「自动替换页面的 token」（默认关，开关会被记住）：开着时 App 自己发出的请求出门前就换成所选 token，页面直接看到替换身份的结果。拿到链接后点「⬇」先填一张单子（选哪条链接、发到哪、文件名、请求头——UA 与来源已铺进那一栏、改栏里的字就按改后的发，M3U8 还问要不要转成 MP4，勾一下就把产物自动传到 Hugging Face 数据集、上传目录可改且会被记住），确认后可以同时投给：本仓库的 Actions（MP4 → aria2.yml，M3U8 → m3u8.yml）、本地/局域网 aria2（JSON-RPC）、MediaGo（HTTP API）—— 后两个由伴生脚本 one-local-dispatch.user.js 代发
 // @match        https://j7tu.com/*
 // @match        http://j7tu.com/*
@@ -97,6 +97,11 @@
  *   没装伴生脚本时这两个勾不会骗人：面板直接说「没检测到转发脚本」，只发 GitHub。
  *   ⚙ 里 aria2/MediaGo 那几栏是本机默认值（RPC 地址、密钥、MediaGo 地址、API Key、
  *   下载目录），单子上可以改，改过就记住 —— 和 HF 那几栏同一个待遇。
+ *
+ * 同一文件的其他镜像进下载列表（v2.19.1）：
+ *   MP4 在媒体池每个成员上都是同一个文件，以前只把主链接铺进 ⬇ 的单子，镜像只写在面板日志里；
+ *   现在主链接后面紧跟其余镜像（标「镜像」、host 不同），选哪条就发哪条 —— 主域抽风时不用
+ *   先去 ⚙ 改播放域名再重取。M3U8 挂在 api 域、params 还是这次详情现生成的，没有镜像可换。
  */
 (function () {
   "use strict";
@@ -120,7 +125,7 @@
      App 只在「从列表点卡片」那一刻发 /v2.5/article/detail；刷新/直开时它一个都不发。
      多盯几个，只要任意一个经过钩子就能还原出 id，拿到 id 后我们自己再发 detail 就行。 */
   var WATCH = [DETAIL, "/v2.5/comment/list", "/v2.5/article/like", "/v2.5/article/download", "/v2.5/panda/url"];
-  var SCRIPT_VERSION = "2.19.0";   // 面板里会打出来，免得再拿旧版截图对新代码
+  var SCRIPT_VERSION = "2.19.1";   // 面板里会打出来，免得再拿旧版截图对新代码
 
   /* one 模块身份：/box/api/splash 下发的共享凭证，iss=4406487，昵称 176*****801。
      它随模块启动由宿主注入，浏览器侧取不到（splash 走 http://ip:6868 且校验 time+uuid 绑定对），
@@ -279,11 +284,22 @@
     return base + (p.charAt(0) === "/" ? p : "/" + p);
   }
   /* 同一个文件在媒体池每个成员上都在（逐 host 发 Range: bytes=0-0，Content-Range 总长一致），
-     所以给完主链接再并列几个镜像，哪个通用哪个。 */
+     所以给完主链接再并列几个镜像，哪个通用哪个。
+     path 可能是根相对路径，也可能是服务端直接给的绝对地址：绝对地址时以它自己的 host 为主，
+     只换 host、路径与查询串原样保留（否则 videoUrl 会把绝对地址原样返回，镜像就全成了同一条）。 */
   function mirrorUrls(path) {
-    var out = [], h = trimSlash(playHost());
+    var p = String(path || "");
+    if (!p) return [];
+    var main, rest;
+    var m = /^https?:\/\/[^/]+/i.exec(p);
+    if (m) { main = trimSlash(m[0]); rest = p.slice(m[0].length) || "/"; }
+    else { main = trimSlash(playHost()); rest = p.charAt(0) === "/" ? p : "/" + p; }
+    var out = [];
     for (var i = 0; i < PLAY_SEEDS.length; i++) {
-      if (trimSlash(PLAY_SEEDS[i]) !== h) out.push(videoUrl(path, PLAY_SEEDS[i]));
+      var h = trimSlash(PLAY_SEEDS[i]);
+      if (!h || h === main) continue;
+      var u = h + rest;
+      if (out.indexOf(u) < 0) out.push(u);
     }
     return out;
   }
@@ -890,9 +906,10 @@
         (locked ? "（锁定态这条清单就是上面那段预告）" : "（正片的清单）"), "dim");
     log("   播放域名 " + host + (CAP.playFrom ? "  （" + CAP.playFrom + "）" : "  （种子：媒体池成员，可在配置里改）"), "dim");
     log("   ts 域名(dn) " + (CAP.dn || "未拦到") + "   ← 只影响 M3U8 分片落在哪个域，mp4 不用它", "dim", true);
-    if (!locked && vf) {
-      var ms = mirrorUrls(vf);
-      if (ms.length) log("   同一文件的其他镜像 " + ms.slice(0, 2).join("   "), "dim");
+    var mp4Path = locked ? pf : vf;
+    if (mp4Path) {
+      var ms = mirrorUrls(mp4Path);
+      if (ms.length) log("   同一文件的其他镜像（⬇ 列表里也会列出来） " + ms.join("   "), "dim");
     }
     // size 是服务端声明的元数据，锁定态下同样显示正片标称大小，不能拿来当「拿到正片」的证据
     log("标称 size " + mb(d.size) + "（服务端元数据，与锁定状态无关，判据只看上面两个路径）", "dim");
@@ -1041,23 +1058,35 @@
 
   /* 可下载候选，排序即优先级，判定规则与 summarize 那四格逐字一致：
      锁定态服务端把 video_file 换成了 preview_video，所以只有「预告」两条；
-     清单只有一个槽位（video_hls 跟着 video_file 走），别把它同时算成正片和预告。 */
+     清单只有一个槽位（video_hls 跟着 video_file 走），别把它同时算成正片和预告。
+     MP4 是媒体池里的同一个文件：主链接后面紧跟其余镜像（mirror=true），选哪条就发哪条；
+     M3U8 挂在 api 域、params 还是这次详情现生成的，没有镜像可换，所以不给它铺。 */
   function downloadPlan(d) {
     var pf = d.preview_video, vf = d.video_file;
     var locked = !!(pf && vf === pf);
     var host = playHost();
     var hl = hlsUrl(d);
     var out = [];
-    function push(who, fmt, url) { if (url) out.push({ who: who, fmt: fmt, url: url }); }
+    function push(who, fmt, url, mirror) { if (url) out.push({ who: who, fmt: fmt, url: url, mirror: !!mirror }); }
+    function pushMp4(who, path) {
+      push(who, "MP4", videoUrl(path, host));
+      var ms = mirrorUrls(path);
+      for (var i = 0; i < ms.length; i++) push(who, "MP4", ms[i], true);
+    }
     if (locked) {
-      push("预告", "MP4", videoUrl(pf, host));
+      pushMp4("预告", pf);
       push("预告", "M3U8", hl);
     } else {
-      push("正片", "MP4", videoUrl(vf, host));
+      pushMp4("正片", vf);
       push("正片", "M3U8", hl);
-      push("预告", "MP4", videoUrl(pf, host));
+      pushMp4("预告", pf);
     }
     return out;
+  }
+
+  /* 日志/错误提示里描述一条候选：镜像要带上 host，否则两条「正片 MP4」看起来像重复项。 */
+  function planLabel(p) {
+    return p.who + " " + p.fmt + (p.mirror ? "·镜像(" + ghHostOf(p.url) + ")" : "");
   }
 
   function ghPick(plan, fmt) {
@@ -1226,7 +1255,7 @@
     var item = sel.item && sel.item.url ? sel.item : ghPick(plan, cfg.fmt);
     if (!item) {
       log("格式选的是「" + (cfg.fmt === "mp4" ? "仅 MP4" : "仅 M3U8") + "」，这次只有 " +
-          plan.map(function (p) { return p.who + " " + p.fmt; }).join(" / ") + " —— 换格式，或换身份重取详情。", "bad");
+          plan.map(planLabel).join(" / ") + " —— 换格式，或换身份重取详情。", "bad");
       return Promise.resolve(null);
     }
     if (!cfg.token) {
@@ -1236,8 +1265,8 @@
     var wf = GH_WF[item.fmt];
     log("── 发到 GitHub 下载 ──", "dim");
     log("   用的详情   " + ((res.from || "?") + "，标题 " + (src.title || "（无）")), "dim");
-    log("   这次可选 " + plan.map(function (p) { return p.who + " " + p.fmt; }).join(" / ") +
-        "   选了 " + item.who + " " + item.fmt +
+    log("   这次可选 " + plan.map(planLabel).join(" / ") +
+        "   选了 " + planLabel(item) +
         (sel.item ? "（面板上选的）" : "（格式设置：" + cfg.fmt + "）"), "dim");
     if (item.who === "预告") log("   注意：下的是预告 —— 这个身份没解锁正片，服务端只回了 preview。", "dim");
     if (item.fmt === "M3U8") {
@@ -1973,8 +2002,10 @@
       r.type = "radio"; r.name = "ghf_item"; r.value = String(i); r.checked = (i === pre);
       lab.appendChild(r);
       /* 这里只写「哪条链接」，不写会投给哪个 workflow：同一张单子可能只发 aria2 / MediaGo，
-         写死「→ aria2.yml」就是在骗人。去向由下面「发送到哪」那一排勾决定。 */
-      lab.appendChild(document.createTextNode(" " + it.who + " " + it.fmt + "（" + ghHostOf(it.url) + "）"));
+         写死「→ aria2.yml」就是在骗人。去向由下面「发送到哪」那一排勾决定。
+         同一文件的其他镜像也铺在列表里（host 就是区别），标一下「镜像」免得以为重复。 */
+      lab.appendChild(document.createTextNode(" " + it.who + " " + it.fmt +
+        (it.mirror ? " · 镜像" : "") + "（" + ghHostOf(it.url) + "）"));
       links.appendChild(lab);
     });
     return links;
